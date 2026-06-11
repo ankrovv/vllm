@@ -454,8 +454,112 @@ def render_for_completion(messages: list[Message]) -> list[int]:
     return token_ids
 
 
+class _HarmonyControlTokens:
+    """Cached Harmony control-token ids used to repair a missing delimiter.
+
+    Resolved lazily from the encoding so there are no magic token numbers.
+    """
+
+    def __init__(self) -> None:
+        enc = get_encoding()
+        self._enc = enc
+
+        def tid(text: str) -> int:
+            return enc.encode(text, allowed_special="all")[0]
+
+        self.channel = tid("<|channel|>")
+        self.message = tid("<|message|>")
+        self.constrain = tid("<|constrain|>")
+        self.recipient = tid(" to")  # start of a ` to=<recipient>` tool target
+        # Tokens that terminate or restart a header; content never starts with one.
+        self.breakers = {
+            tid("<|channel|>"),
+            tid("<|start|>"),
+            tid("<|end|>"),
+            tid("<|return|>"),
+            tid("<|call|>"),
+        }
+        # Channel names whose content is user-visible (so a dropped body matters),
+        # as their token sequences (e.g. ``commentary`` is two tokens).
+        self.visible_channel_token_seqs = {
+            tuple(enc.encode("final", allowed_special="all")),
+            tuple(enc.encode("commentary", allowed_special="all")),
+        }
+
+    def is_whitespace(self, token_id: int) -> bool:
+        try:
+            return self._enc.decode([token_id]).strip() == ""
+        except Exception:
+            return False
+
+
+_harmony_control: _HarmonyControlTokens | None = None
+
+
+def _get_harmony_control() -> _HarmonyControlTokens:
+    global _harmony_control
+    if _harmony_control is None:
+        _harmony_control = _HarmonyControlTokens()
+    return _harmony_control
+
+
+class _RepairingStreamableParser(StreamableParser):
+    """``StreamableParser`` that repairs a visible channel header emitted without
+    its ``<|message|>`` delimiter.
+
+    GPT-OSS occasionally emits a user-visible channel header (``<|channel|>final``
+    or ``<|channel|>commentary``) directly followed by the message body, omitting
+    the required ``<|message|>`` delimiter. The base parser then never leaves the
+    header state and the generated answer is silently dropped (the response
+    returns ``content=None`` even though the tokens were generated and billed).
+
+    This subclass watches the token stream and inserts the missing ``<|message|>``
+    before the first content token, so the body flows through the normal (lossless)
+    content path. It is a no-op on well-formed output. Because every consumer --
+    streaming chat, non-streaming chat, and the Responses API -- builds its parser
+    through ``get_streamable_parser_for_assistant``, repairing here covers them all.
+    """
+
+    def __init__(
+        self, encoding: Any, role: Any, *, strict: bool = True
+    ) -> None:
+        super().__init__(encoding, role, strict=strict)
+        self._ctrl = _get_harmony_control()
+        # State of the small header-tracking machine.
+        self._reading_channel_name = False  # just saw ``<|channel|>``
+        self._channel_name: tuple[int, ...] = ()
+        self._awaiting_delimiter = False  # in a visible header, no delimiter yet
+
+    def process(self, token: int) -> "StreamableParser":
+        ctrl = self._ctrl
+        if self._awaiting_delimiter:
+            terminal = token in (ctrl.message, ctrl.constrain, ctrl.recipient)
+            if terminal or token in ctrl.breakers:
+                # Well-formed (``<|message|>``), typed, tool-call, or empty header.
+                self._awaiting_delimiter = False
+            elif not ctrl.is_whitespace(token):
+                # Content with no delimiter: insert ``<|message|>`` before it.
+                super().process(ctrl.message)
+                self._awaiting_delimiter = False
+            return super().process(token)
+        if self._reading_channel_name:
+            self._channel_name += (token,)
+            name = self._channel_name
+            seqs = ctrl.visible_channel_token_seqs
+            if name in seqs:
+                self._reading_channel_name = False
+                self._awaiting_delimiter = True
+            elif not any(seq[: len(name)] == name for seq in seqs):
+                self._reading_channel_name = False  # analysis / unrecognized
+            return super().process(token)
+        if token == ctrl.channel:
+            self._reading_channel_name = True
+            self._channel_name = ()
+        return super().process(token)
+
+
 def get_streamable_parser_for_assistant() -> StreamableParser:
-    return StreamableParser(get_encoding(), role=Role.ASSISTANT)
+    return _RepairingStreamableParser(get_encoding(), role=Role.ASSISTANT)
 
 
 def parse_output_into_messages(token_ids: Iterable[int]) -> StreamableParser:

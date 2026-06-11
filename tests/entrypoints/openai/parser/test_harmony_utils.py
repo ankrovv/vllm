@@ -12,11 +12,13 @@ from vllm.entrypoints.openai.parser.harmony_utils import (
     create_tool_definition,
     extract_function_from_recipient,
     get_encoding,
+    get_streamable_parser_for_assistant,
     get_system_message,
     has_custom_tools,
     is_function_recipient,
     parse_chat_input_to_harmony_message,
     parse_chat_output,
+    parse_output_into_messages,
 )
 from vllm.entrypoints.openai.responses.harmony import (
     response_input_to_harmony,
@@ -1171,3 +1173,136 @@ class TestResponseInputToHarmonyReasoningItem:
         msg = response_input_to_harmony(item, prev_responses=[])
 
         assert msg is None
+
+
+def _tok(text: str) -> list[int]:
+    return get_encoding().encode(text, allowed_special="all")
+
+
+# Harmony control tokens used to assemble test streams.
+_CHANNEL = _tok("<|channel|>")[0]
+_MESSAGE = _tok("<|message|>")[0]
+_END = _tok("<|end|>")[0]
+_START = _tok("<|start|>")[0]
+_RETURN = _tok("<|return|>")[0]
+
+
+def _analysis(text: str) -> list[int]:
+    return [_CHANNEL, *_tok("analysis"), _MESSAGE, *_tok(text), _END]
+
+
+def _assistant_header() -> list[int]:
+    return [_START, *_tok("assistant")]
+
+
+def _streamed_final(tokens: list[int]) -> str | None:
+    """Mirror the streaming chat path: feed tokens incrementally and accumulate
+    the visible content deltas from the parser."""
+    parser = get_streamable_parser_for_assistant()
+    out = ""
+    for token in tokens:
+        parser.process(token)
+        if parser.current_channel in ("final", "commentary") and (
+            not parser.current_recipient
+        ):
+            out += parser.last_content_delta or ""
+    return out or None
+
+
+class TestRepairUnterminatedVisibleChannel:
+    """A final/commentary header emitted without the ``<|message|>`` delimiter is
+    silently dropped by the base parser. get_streamable_parser_for_assistant
+    returns a parser that repairs it, so every path (non-streaming chat, the
+    openai tool parser, streaming chat, and the Responses API -- all of which
+    build their parser through that helper) recovers the content."""
+
+    def test_malformed_final_recovers_on_all_paths(self):
+        # ``<|channel|>final {"answer": "hi"}<|return|>`` with no ``<|message|>``.
+        tokens = [
+            *_analysis("thinking"),
+            *_assistant_header(),
+            _CHANNEL,
+            *_tok("final"),
+            *_tok(' {"answer": "hi"}'),
+            _RETURN,
+        ]
+        # Non-streaming chat (parse_chat_output).
+        reasoning, content, _ = parse_chat_output(tokens)
+        assert content is not None and "answer" in content
+        assert reasoning == "thinking"
+
+        # Shared parser (also what the openai tool parser reads).
+        finals = [m for m in parse_output_into_messages(tokens).messages
+                  if m.channel == "final"]
+        assert finals and "answer" in finals[0].content[0].text
+
+        # Streaming chat.
+        streamed = _streamed_final(tokens)
+        assert streamed is not None and "answer" in streamed
+
+    def test_malformed_commentary_preamble_recovers_content(self):
+        tokens = [
+            *_analysis("thinking"),
+            *_assistant_header(),
+            _CHANNEL,
+            *_tok("commentary"),
+            *_tok(" Here is a summary."),
+            _RETURN,
+        ]
+        _, content, _ = parse_chat_output(tokens)
+        assert content is not None and "summary" in content
+        assert _streamed_final(tokens) is not None
+
+    def test_no_space_after_channel_recovers_correctly(self):
+        # ``final{...}`` (no separator) -- the token-level boundary must still be
+        # the channel name, not ``final{``.
+        tokens = [
+            *_analysis("x"),
+            *_assistant_header(),
+            _CHANNEL,
+            *_tok("final"),
+            *_tok('{"answer": "hi"}'),
+            _RETURN,
+        ]
+        _, content, _ = parse_chat_output(tokens)
+        assert content == '{"answer": "hi"}'
+
+    def test_well_formed_final_is_noop(self):
+        tokens = [
+            *_analysis("thinking"),
+            *_assistant_header(),
+            _CHANNEL,
+            *_tok("final"),
+            _MESSAGE,
+            *_tok('{"answer": "hi"}'),
+            _RETURN,
+        ]
+        _, content, _ = parse_chat_output(tokens)
+        assert content == '{"answer": "hi"}'
+        assert _streamed_final(tokens) == '{"answer": "hi"}'
+
+    def test_analysis_only_has_no_visible_content(self):
+        tokens = [_CHANNEL, *_tok("analysis"), _MESSAGE, *_tok("reasoning"), _RETURN]
+        _, content, _ = parse_chat_output(tokens)
+        assert content is None
+
+    def test_empty_final_stays_empty(self):
+        # First message: the parser is pre-seeded with the assistant role, so no
+        # leading ``<|start|>`` is needed.
+        tokens = [_CHANNEL, *_tok("final"), _MESSAGE, _RETURN]
+        _, content, _ = parse_chat_output(tokens)
+        assert content is None
+
+    def test_tool_call_commentary_is_not_treated_as_content(self):
+        # ``commentary`` with a recipient is a tool call, not visible content;
+        # the repair must not fire.
+        tokens = [
+            _CHANNEL,
+            *_tok("commentary"),
+            *_tok(" to=functions.get_weather"),
+            _MESSAGE,
+            *_tok('{"city": "Paris"}'),
+            _RETURN,
+        ]
+        _, content, _ = parse_chat_output(tokens)
+        assert content is None
