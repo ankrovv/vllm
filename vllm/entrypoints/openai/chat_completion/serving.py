@@ -41,7 +41,9 @@ from vllm.entrypoints.openai.engine.protocol import (
     DeltaMessage,
     DeltaToolCall,
     ErrorResponse,
+    ExtractedToolCallInformation,
     FunctionCall,
+    FunctionDefinition,
     PromptTokenUsageInfo,
     RequestResponseMetadata,
     ToolCall,
@@ -68,11 +70,19 @@ from vllm.parser import ParserManager
 from vllm.parser.abstract_parser import Parser
 from vllm.reasoning import ReasoningParser
 from vllm.renderers import ChatParams
-from vllm.sampling_params import BeamSearchParams, SamplingParams
+from vllm.sampling_params import (
+    BeamSearchParams,
+    SamplingParams,
+    StructuredOutputsParams,
+)
 from vllm.tokenizers import TokenizerLike
 from vllm.tool_parsers.streaming import (
     extract_named_tool_call_streaming,
     extract_required_tool_call_streaming,
+)
+from vllm.tool_parsers.utils import (
+    get_required_tool_json_schema,
+    parse_required_tool_json,
 )
 from vllm.utils.collection_utils import as_list
 from vllm.utils.mistral import is_mistral_tokenizer, is_mistral_tool_parser
@@ -224,6 +234,11 @@ class OpenAIServingChat(OpenAIServing):
         if self.engine_client.errored:
             raise self.engine_client.dead_error
 
+        if request.use_beam_search and self._is_harmony_required_tool_choice(request):
+            return self.create_error_response(
+                "Beam search is not supported with Harmony tool_choice='required'."
+            )
+
         return await self.openai_serving_render.render_chat(request)
 
     async def create_chat_completion(
@@ -301,6 +316,10 @@ class OpenAIServingChat(OpenAIServing):
                     max_tokens,
                     self.default_sampling_params,
                 )
+                if self._is_harmony_required_tool_choice(request):
+                    sampling_params.structured_outputs = StructuredOutputsParams(
+                        json=self._harmony_required_tool_json_schema(request)
+                    )
 
             self._log_inputs(
                 sub_request_id,
@@ -388,6 +407,67 @@ class OpenAIServingChat(OpenAIServing):
             return self.response_role
         return request.messages[-1]["role"]
 
+    def _is_harmony_required_tool_choice(
+        self,
+        request: ChatCompletionRequest,
+    ) -> bool:
+        return self.use_harmony and request.tool_choice == "required" and bool(
+            request.tools
+        )
+
+    def _parse_harmony_required_tool_calls(
+        self,
+        request: ChatCompletionRequest,
+        text: str,
+    ) -> list[FunctionDefinition]:
+        return parse_required_tool_json(text=text, tools=request.tools)
+
+    @staticmethod
+    def _harmony_required_tool_max_items(
+        request: ChatCompletionRequest,
+    ) -> int | None:
+        if request.parallel_tool_calls is False or request.stream:
+            # The required-tool streaming path tracks one tool call at a time.
+            return 1
+        return None
+
+    def _harmony_required_tool_json_schema(
+        self,
+        request: ChatCompletionRequest,
+    ) -> dict:
+        return get_required_tool_json_schema(
+            tools=request.tools,
+            max_items=self._harmony_required_tool_max_items(request),
+        )
+
+    def _make_chat_tool_calls_from_required_json(
+        self,
+        request: ChatCompletionRequest,
+        text: str,
+        *,
+        start_index: int,
+    ) -> list[ToolCall]:
+        tool_calls = self._parse_harmony_required_tool_calls(request, text)
+        chat_tool_calls = []
+        for idx, tool_call in enumerate(tool_calls):
+            chat_tool_calls.append(
+                ToolCall(
+                    id=make_tool_call_id(
+                        id_type=self.tool_call_id_type,
+                        func_name=tool_call.name,
+                        idx=start_index + idx,
+                    ),
+                    function=FunctionCall(
+                        name=tool_call.name,
+                        arguments=json.dumps(
+                            tool_call.parameters,
+                            ensure_ascii=False,
+                        ),
+                    ),
+                )
+            )
+        return chat_tool_calls
+
     def extract_tool_call_required_streaming(
         self,
         previous_text: str,
@@ -427,11 +507,15 @@ class OpenAIServingChat(OpenAIServing):
         finish_reason_sent = [False] * num_choices
         num_prompt_tokens = 0
         num_cached_tokens = None
+        is_harmony_required_tool_choice = self._is_harmony_required_tool_choice(
+            request
+        )
         if self.use_harmony:
             harmony_parsers = [
                 get_streamable_parser_for_assistant() for _ in range(num_choices)
             ]
             harmony_tools_streamed = [False] * num_choices
+        required_tool_name_returned = [False] * num_choices
         tools_streamed = [False] * num_choices
 
         is_mistral_grammar_path = request._grammar_from_tool_parser
@@ -635,7 +719,9 @@ class OpenAIServingChat(OpenAIServing):
                     else:
                         logprobs = None
 
-                    if self.use_harmony:
+                    if is_harmony_required_tool_choice:
+                        delta_text = output.text
+                    elif self.use_harmony:
                         harmony_parser = harmony_parsers[i]
                         prev_recipient = harmony_parser.current_recipient
 
@@ -677,6 +763,8 @@ class OpenAIServingChat(OpenAIServing):
                         is_mistral_grammar_path
                         or tool_choice_auto
                         or tool_choice_uses_parser
+                        or tool_choice_function_name
+                        or request.tool_choice == "required"
                         or reasoning_parser
                     ):
                         assert previous_texts is not None
@@ -692,7 +780,33 @@ class OpenAIServingChat(OpenAIServing):
                         else:
                             current_token_ids = as_list(output.token_ids)
 
-                    if self.use_harmony:
+                    if is_harmony_required_tool_choice:
+                        if output.finish_reason is not None:
+                            try:
+                                if output.finish_reason != "length":
+                                    self._parse_harmony_required_tool_calls(
+                                        request,
+                                        current_text,
+                                    )
+                            except ValueError as exc:
+                                raise GenerationError(
+                                    "Failed to parse required tool-choice output."
+                                ) from exc
+                        delta_message, required_tool_name_returned[i] = (
+                            extract_required_tool_call_streaming(
+                                previous_text=previous_text,
+                                current_text=current_text,
+                                delta_text=delta_text,
+                                function_name_returned=required_tool_name_returned[i],
+                                tool_call_idx=history_tool_call_cnt,
+                                tool_call_id_type=self.tool_call_id_type,
+                            )
+                        )
+                        if delta_message and delta_message.tool_calls:
+                            tools_streamed[i] = True
+                            if delta_message.tool_calls[0].id is not None:
+                                history_tool_call_cnt += 1
+                    elif self.use_harmony:
                         delta_message, tools_streamed_flag = (
                             extract_harmony_streaming_delta(
                                 harmony_parser=harmony_parser,
@@ -878,6 +992,8 @@ class OpenAIServingChat(OpenAIServing):
                         is_mistral_grammar_path
                         or tool_choice_auto
                         or tool_choice_uses_parser
+                        or tool_choice_function_name
+                        or request.tool_choice == "required"
                         or reasoning_parser
                     ) and not self.use_harmony:
                         assert previous_texts is not None
@@ -1027,6 +1143,11 @@ class OpenAIServingChat(OpenAIServing):
                         # "tool_calls" for "auto" or "required" tool calls,
                         # and "stop" for named tool calls.
                         if (
+                            is_harmony_required_tool_choice
+                            and output.finish_reason == "length"
+                        ):
+                            finish_reason_ = "length"
+                        elif (
                             auto_tools_called
                             or (tools_streamed[i] and not tool_choice_function_name)
                             or (self.use_harmony and harmony_tools_streamed[i])
@@ -1200,11 +1321,47 @@ class OpenAIServingChat(OpenAIServing):
                 logprobs = None
 
             if self.use_harmony:
-                reasoning, content, _ = parse_chat_output(token_ids)
-                if not request.include_reasoning:
+                if self._is_harmony_required_tool_choice(request):
+                    # Required tool choice constrains GPT-OSS to emit raw JSON
+                    # after the prefixed Harmony final-message marker.
                     reasoning = None
+                    if output.finish_reason == "length":
+                        message = ChatMessage(
+                            role=role,
+                            reasoning=reasoning,
+                            content="",
+                            tool_calls=[],
+                        )
+                    else:
+                        try:
+                            tool_call_class_items = (
+                                self._make_chat_tool_calls_from_required_json(
+                                    request,
+                                    output.text,
+                                    start_index=history_tool_call_cnt,
+                                )
+                            )
+                        except ValueError as exc:
+                            raise GenerationError(
+                                "Failed to parse required tool-choice output."
+                            ) from exc
+                        history_tool_call_cnt += len(tool_call_class_items)
+                        message = ChatMessage(
+                            role=role,
+                            reasoning=reasoning,
+                            content="",
+                            tool_calls=tool_call_class_items,
+                        )
+                    tool_call_info = ExtractedToolCallInformation(
+                        tools_called=bool(message.tool_calls),
+                        tool_calls=message.tool_calls,
+                        content=message.content,
+                    )
+                elif self.tool_parser is not None:
+                    reasoning, content, _ = parse_chat_output(token_ids)
+                    if not request.include_reasoning:
+                        reasoning = None
 
-                if self.tool_parser is not None:
                     if tokenizer is None:
                         raise ValueError(
                             "Tokenizer not available when `skip_tokenizer_init=True`"
@@ -1225,6 +1382,10 @@ class OpenAIServingChat(OpenAIServing):
                         tool_calls=tool_call_info.tool_calls,
                     )
                 else:
+                    reasoning, content, _ = parse_chat_output(token_ids)
+                    if not request.include_reasoning:
+                        reasoning = None
+
                     message = ChatMessage(
                         role=role,
                         reasoning=reasoning,
