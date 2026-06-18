@@ -3,6 +3,7 @@
 
 import ast
 import json
+from copy import deepcopy
 from json import JSONDecodeError, JSONDecoder
 from typing import Any, TypeAlias
 
@@ -13,6 +14,7 @@ from openai.types.responses import (
 )
 from openai.types.responses.tool import Tool as ResponsesTool
 from partial_json_parser.core.options import Allow
+from pydantic import TypeAdapter, ValidationError
 
 from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionNamedToolChoiceParam,
@@ -22,6 +24,7 @@ from vllm.entrypoints.openai.engine.protocol import (
     DeltaFunctionCall,
     DeltaToolCall,
     FunctionCall,
+    FunctionDefinition,
     ToolCall,
 )
 from vllm.logger import init_logger
@@ -251,6 +254,58 @@ def get_json_schema_from_tools(
         return _get_json_schema_from_tools(tools)
     # tool_choice: "auto"
     return None
+
+
+def get_required_tool_json_schema(
+    tools: list[Tool] | None,
+    *,
+    max_items: int | None = None,
+) -> dict:
+    """Build the constrained JSON schema used to force required tool calls."""
+    if tools is None:
+        raise ValueError("tool_choice='required' requires function tools.")
+    json_schema = _get_json_schema_from_tools(deepcopy(tools))
+    if max_items is not None:
+        json_schema["maxItems"] = max_items
+    return json_schema
+
+
+def parse_required_tool_json(
+    *,
+    text: str,
+    tools: list[Tool] | None,
+) -> list[FunctionDefinition]:
+    """Parse constrained JSON output into function-call definitions."""
+    try:
+        tool_calls = TypeAdapter(list[FunctionDefinition]).validate_json(text)
+    except ValidationError as exc:
+        raise ValueError(
+            "Failed to parse required tool-choice output as tool-call JSON."
+        ) from exc
+    if not tool_calls:
+        raise ValueError(
+            "Required tool-choice output did not contain any tool calls."
+        )
+
+    allowed_tool_names = set[str]()
+    for tool in tools or []:
+        if isinstance(tool, FunctionTool):
+            allowed_tool_names.add(tool.name)
+        elif isinstance(tool, ChatCompletionToolsParam):
+            allowed_tool_names.add(tool.function.name)
+
+    for tool_call in tool_calls:
+        if tool_call.name not in allowed_tool_names:
+            raise ValueError(
+                "Required tool-choice output referenced an unknown tool: "
+                f"{tool_call.name!r}."
+            )
+        if tool_call.parameters is None:
+            raise ValueError(
+                "Required tool-choice output did not include object "
+                f"parameters for tool {tool_call.name!r}."
+            )
+    return tool_calls
 
 
 # ---------------------------------------------------------------------------

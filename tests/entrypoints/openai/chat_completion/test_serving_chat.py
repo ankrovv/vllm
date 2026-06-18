@@ -1083,6 +1083,7 @@ class TestServingChatWithHarmony:
         mock_engine = MagicMock(spec=AsyncLLM)
         mock_engine.errored = False
         mock_engine.model_config = MockModelConfig()
+        mock_engine.model_config.max_model_len = 4096
         mock_engine.input_processor = MagicMock()
         mock_engine.renderer = _build_renderer(mock_engine.model_config)
         return mock_engine
@@ -1091,19 +1092,27 @@ class TestServingChatWithHarmony:
     def serving_chat(self, mock_engine) -> OpenAIServingChat:
         chat = _build_serving_chat(mock_engine)
         chat.use_harmony = True
+        chat.openai_serving_render.use_harmony = True
         chat.tool_parser = ToolParserManager.get_tool_parser("openai")
         return chat
 
     def mock_request_output_from_req_and_token_ids(
-        self, req: ChatCompletionRequest, token_ids: list[int], finished: bool = False
+        self,
+        req: ChatCompletionRequest,
+        token_ids: list[int],
+        finished: bool = False,
+        *,
+        text: str = "",
+        finish_reason: str | None = None,
     ) -> RequestOutput:
         # Our tests don't use most fields, so just get the token ids correct
         completion_output = CompletionOutput(
             index=0,
-            text="",
+            text=text,
             token_ids=token_ids,
             cumulative_logprob=0.0,
             logprobs=None,
+            finish_reason=finish_reason,
         )
         return RequestOutput(
             request_id=req.request_id,
@@ -1187,6 +1196,291 @@ class TestServingChatWithHarmony:
         if stream:
             return await accumulate_streaming_response(result)
         return await result
+
+    async def generate_response_from_required_tool_json(
+        self,
+        serving_chat: OpenAIServingChat,
+        req: ChatCompletionRequest,
+        tool_json: str,
+        *,
+        stream: bool = False,
+        finish_reason: str = "stop",
+    ) -> ChatCompletionResponse:
+        async def result_generator():
+            if stream:
+                for start in range(0, len(tool_json), 7):
+                    chunk = tool_json[start : start + 7]
+                    yield self.mock_request_output_from_req_and_token_ids(
+                        req,
+                        [1],
+                        text=chunk,
+                    )
+                yield self.mock_request_output_from_req_and_token_ids(
+                    req,
+                    [],
+                    finished=True,
+                    text="",
+                    finish_reason=finish_reason,
+                )
+            else:
+                yield self.mock_request_output_from_req_and_token_ids(
+                    req,
+                    [1],
+                    finished=True,
+                    text=tool_json,
+                    finish_reason=finish_reason,
+                )
+
+        generator_func = (
+            serving_chat.chat_completion_stream_generator
+            if stream
+            else serving_chat.chat_completion_full_generator
+        )
+
+        result = generator_func(
+            request=req,
+            result_generator=result_generator(),
+            request_id=req.request_id,
+            model_name=req.model,
+            conversation=[],
+            tokenizer=get_tokenizer(req.model),
+            request_metadata=RequestResponseMetadata(
+                request_id=req.request_id,
+                model_name=req.model,
+            ),
+        )
+
+        if stream:
+            return await accumulate_streaming_response(result)
+        return await result
+
+    @pytest.mark.asyncio
+    async def test_harmony_required_tool_choice_prefills_final_message(
+        self, serving_chat, weather_tools
+    ):
+        messages = [{"role": "user", "content": "Use one available tool."}]
+        suffix_token_ids = get_encoding().encode(
+            "<|channel|>final<|message|>", allowed_special="all"
+        )
+
+        required_req = ChatCompletionRequest(
+            model=MODEL_NAME,
+            messages=messages,
+            tools=weather_tools,
+            tool_choice="required",
+        )
+        result = await serving_chat.render_chat_request(required_req)
+        assert not isinstance(result, ErrorResponse)
+        _, engine_inputs = result
+        required_prompt_ids = serving_chat._extract_prompt_components(
+            engine_inputs[0]
+        ).token_ids
+        assert required_prompt_ids is not None
+        assert required_prompt_ids[-len(suffix_token_ids) :] == suffix_token_ids
+
+        auto_req = ChatCompletionRequest(
+            model=MODEL_NAME,
+            messages=messages,
+            tools=weather_tools,
+            tool_choice="auto",
+        )
+        result = await serving_chat.render_chat_request(auto_req)
+        assert not isinstance(result, ErrorResponse)
+        _, engine_inputs = result
+        auto_prompt_ids = serving_chat._extract_prompt_components(
+            engine_inputs[0]
+        ).token_ids
+        assert auto_prompt_ids is not None
+        assert auto_prompt_ids[-len(suffix_token_ids) :] != suffix_token_ids
+
+    @pytest.mark.asyncio
+    async def test_harmony_required_tool_choice_sets_json_schema(
+        self, serving_chat, mock_engine, weather_tools
+    ):
+        tool_json = '[{"name":"get_weather","parameters":{"location":"Paris"}}]'
+        captured_sampling_params = None
+
+        def generate(engine_input, sampling_params, request_id, **kwargs):
+            nonlocal captured_sampling_params
+            captured_sampling_params = sampling_params
+
+            async def result_generator():
+                yield RequestOutput(
+                    request_id=request_id,
+                    prompt=[],
+                    prompt_token_ids=[],
+                    prompt_logprobs=None,
+                    outputs=[
+                        CompletionOutput(
+                            index=0,
+                            text=tool_json,
+                            token_ids=[1],
+                            cumulative_logprob=0.0,
+                            logprobs=None,
+                            finish_reason="stop",
+                        )
+                    ],
+                    finished=True,
+                )
+
+            return result_generator()
+
+        mock_engine.generate = MagicMock(side_effect=generate)
+        req = ChatCompletionRequest(
+            model=MODEL_NAME,
+            messages=[{"role": "user", "content": "Use one available tool."}],
+            tools=weather_tools,
+            tool_choice="required",
+        )
+
+        response = await serving_chat.create_chat_completion(req)
+
+        assert captured_sampling_params is not None
+        assert captured_sampling_params.structured_outputs is not None
+        json_schema = captured_sampling_params.structured_outputs.json
+        assert json_schema["type"] == "array"
+        assert json_schema["minItems"] == 1
+        assert json_schema["items"]["anyOf"][0]["properties"]["name"]["enum"] == [
+            "get_weather"
+        ]
+        verify_chat_response(
+            response,
+            tool_calls=[("get_weather", '{"location": "Paris"}')],
+        )
+        assert response.choices[0].finish_reason == "tool_calls"
+
+    @pytest.mark.asyncio
+    async def test_harmony_required_tool_choice_render_request_sets_json_schema(
+        self, serving_chat, weather_tools
+    ):
+        req = ChatCompletionRequest(
+            model=MODEL_NAME,
+            messages=[{"role": "user", "content": "Use one available tool."}],
+            tools=weather_tools,
+            tool_choice="required",
+        )
+
+        generate_request = await (
+            serving_chat.openai_serving_render.render_chat_request(req)
+        )
+
+        assert not isinstance(generate_request, ErrorResponse)
+        assert generate_request.sampling_params.structured_outputs is not None
+        json_schema = generate_request.sampling_params.structured_outputs.json
+        assert json_schema["items"]["anyOf"][0]["properties"]["name"]["enum"] == [
+            "get_weather"
+        ]
+
+    @pytest.mark.asyncio
+    async def test_harmony_required_tool_choice_rejects_beam_search(
+        self, serving_chat, weather_tools
+    ):
+        req = ChatCompletionRequest(
+            model=MODEL_NAME,
+            messages=[{"role": "user", "content": "Use one available tool."}],
+            tools=weather_tools,
+            tool_choice="required",
+            use_beam_search=True,
+        )
+
+        response = await serving_chat.create_chat_completion(req)
+
+        assert isinstance(response, ErrorResponse)
+        assert "Beam search is not supported" in response.error.message
+
+    @pytest.mark.parametrize(
+        "request_kwargs",
+        [
+            {"parallel_tool_calls": False},
+            {"stream": True},
+        ],
+    )
+    def test_harmony_required_tool_choice_limits_single_call_schema(
+        self, serving_chat, weather_tools, request_kwargs
+    ):
+        req = ChatCompletionRequest(
+            model=MODEL_NAME,
+            messages=[{"role": "user", "content": "Use one available tool."}],
+            tools=weather_tools,
+            tool_choice="required",
+            **request_kwargs,
+        )
+
+        json_schema = serving_chat._harmony_required_tool_json_schema(req)
+
+        assert json_schema["maxItems"] == 1
+
+    @pytest.mark.asyncio
+    async def test_harmony_required_tool_choice_json_response(
+        self, serving_chat, stream, weather_tools
+    ):
+        req = ChatCompletionRequest(
+            model=MODEL_NAME,
+            messages=[{"role": "user", "content": "Use one available tool."}],
+            tools=weather_tools,
+            tool_choice="required",
+            stream=stream,
+        )
+        response = await self.generate_response_from_required_tool_json(
+            serving_chat,
+            req,
+            '[{"name":"get_weather","parameters":{"location":"Paris"}}]',
+            stream=stream,
+        )
+
+        message = response.choices[0].message
+        assert len(message.tool_calls) == 1
+        tool_call = message.tool_calls[0]
+        assert tool_call.function.name == "get_weather"
+        assert json.loads(tool_call.function.arguments) == {"location": "Paris"}
+        assert response.choices[0].finish_reason == "tool_calls"
+
+    @pytest.mark.asyncio
+    async def test_harmony_required_tool_choice_length_does_not_emit_partial_tool(
+        self, serving_chat, weather_tools
+    ):
+        req = ChatCompletionRequest(
+            model=MODEL_NAME,
+            messages=[{"role": "user", "content": "Use one available tool."}],
+            tools=weather_tools,
+            tool_choice="required",
+        )
+        response = await self.generate_response_from_required_tool_json(
+            serving_chat,
+            req,
+            '[{"name":"get_weather"',
+            finish_reason="length",
+        )
+
+        verify_chat_response(response)
+        assert response.choices[0].finish_reason == "length"
+
+    @pytest.mark.asyncio
+    async def test_harmony_required_tool_choice_streaming_length_finish_reason(
+        self, serving_chat, weather_tools
+    ):
+        req = ChatCompletionRequest(
+            model=MODEL_NAME,
+            messages=[{"role": "user", "content": "Use one available tool."}],
+            tools=weather_tools,
+            tool_choice="required",
+            stream=True,
+        )
+        response = await self.generate_response_from_required_tool_json(
+            serving_chat,
+            req,
+            '[{"name":"get_weather","parameters":{"location":"Par',
+            stream=True,
+            finish_reason="length",
+        )
+
+        message = response.choices[0].message
+        assert message.tool_calls is not None
+        assert len(message.tool_calls) == 1
+        tool_call = message.tool_calls[0]
+        assert tool_call.function.name == "get_weather"
+        assert tool_call.function.arguments.startswith('{"location":"Par')
+        assert response.choices[0].finish_reason == "length"
 
     @pytest.mark.asyncio
     async def test_simple_chat(self, serving_chat, stream):
