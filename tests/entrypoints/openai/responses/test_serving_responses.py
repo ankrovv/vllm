@@ -25,7 +25,7 @@ from openai.types.responses.tool import (
     Mcp,
     Tool,
 )
-from openai_harmony import Role
+from openai_harmony import HarmonyError, Role
 
 import vllm.envs as envs
 from vllm.entrypoints.mcp.tool_server import ToolServer
@@ -40,7 +40,12 @@ from vllm.entrypoints.openai.parser.harmony_utils import (
     get_encoding,
     render_for_completion,
 )
-from vllm.entrypoints.openai.responses.context import ConversationContext, SimpleContext
+from vllm.entrypoints.openai.responses.context import (
+    ConversationContext,
+    HarmonyContext,
+    SimpleContext,
+    StreamingHarmonyContext,
+)
 from vllm.entrypoints.openai.responses.protocol import (
     ResponseCreatedEvent,
     ResponseRawMessageAndToken,
@@ -918,6 +923,65 @@ class TestHarmonyPreambleStreaming:
 
         type_names = [e.type for e in events]
         assert "response.output_text.done" not in type_names
+
+
+def _make_harmony_request_output(
+    token_ids: list[int], *, finished: bool = True
+) -> RequestOutput:
+    completion = CompletionOutput(
+        index=0,
+        text="",
+        token_ids=token_ids,
+        cumulative_logprob=0.0,
+        logprobs=None,
+        finish_reason="stop" if finished else None,
+        stop_reason=None,
+    )
+    return RequestOutput(
+        request_id="req_harmony_terminal",
+        prompt="hi",
+        prompt_token_ids=[7, 8],
+        prompt_logprobs=None,
+        outputs=[completion],
+        finished=finished,
+        num_cached_tokens=0,
+    )
+
+
+def test_harmony_context_defers_parse_error_to_terminal(monkeypatch) -> None:
+    from vllm.entrypoints.openai.responses import context as context_module
+
+    context = HarmonyContext([], [])
+    failing_parser = MagicMock()
+    failing_parser.process.side_effect = HarmonyError("malformed header")
+    reset_parser = MagicMock()
+    parsers = iter((failing_parser, reset_parser))
+    monkeypatch.setattr(
+        context_module,
+        "get_streamable_parser_for_assistant",
+        lambda: next(parsers),
+    )
+
+    context.append_output(_make_harmony_request_output([101, 102]))
+
+    assert context.harmony_parse_failed is True
+    assert context.output_token_ids == [101, 102]
+    assert context.finish_reason == "stop"
+    assert context.messages == []
+
+
+def test_streaming_harmony_context_defers_parse_error_to_terminal() -> None:
+    context = StreamingHarmonyContext([], [])
+    context.parser = MagicMock()
+    context.parser.process.side_effect = HarmonyError("malformed header")
+
+    context.append_output(_make_harmony_request_output([201, 202]))
+
+    assert context.harmony_parse_failed is True
+    assert context.output_token_ids == [201, 202]
+    assert context.finish_reason == "stop"
+    assert context.last_output_finished is True
+    assert context.last_content_delta is None
 
 
 def _make_simple_context_with_output(text, token_ids):

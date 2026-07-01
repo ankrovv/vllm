@@ -9,7 +9,7 @@ from collections.abc import AsyncGenerator, AsyncIterator, Callable, Mapping, Se
 from contextlib import AsyncExitStack
 from copy import copy
 from http import HTTPStatus
-from typing import Any, Final, cast
+from typing import Any, Final
 
 from fastapi import Request
 from openai.types.responses import (
@@ -24,6 +24,7 @@ from openai.types.responses import (
 from openai.types.responses.response_output_text import Logprob, LogprobTopLogprob
 from openai.types.responses.tool import Mcp, Tool
 from openai_harmony import Message as OpenAIHarmonyMessage
+from pydantic import TypeAdapter
 
 from vllm import envs
 from vllm.config.utils import replace
@@ -47,6 +48,9 @@ from vllm.entrypoints.openai.engine.serving import (
 )
 from vllm.entrypoints.openai.models.serving import OpenAIServingModels
 from vllm.entrypoints.openai.parser.harmony_utils import (
+    CONTENT_NULL_STOP_REASON,
+    HarmonyTerminalResult,
+    HarmonyTerminalState,
     build_harmony_preamble,
     extract_instructions_from_messages,
     get_encoding,
@@ -62,6 +66,7 @@ from vllm.entrypoints.openai.responses.context import (
     StreamingHarmonyContext,
 )
 from vllm.entrypoints.openai.responses.harmony import (
+    apply_harmony_terminal_invariant,
     construct_harmony_previous_input_messages,
     harmony_to_response_output,
     parser_state_to_response_output,
@@ -72,6 +77,7 @@ from vllm.entrypoints.openai.responses.protocol import (
     OutputTokensDetails,
     ResponseCompletedEvent,
     ResponseCreatedEvent,
+    ResponseIncompleteEvent,
     ResponseInProgressEvent,
     ResponseInputOutputItem,
     ResponseInputOutputMessage,
@@ -86,6 +92,8 @@ from vllm.entrypoints.openai.responses.streaming_events import (
     _StateType,
     emit_content_delta_events,
     emit_previous_item_done_events,
+    emit_text_delta_events,
+    emit_text_output_done_events,
     emit_tool_action_events,
     split_delta,
 )
@@ -954,6 +962,7 @@ class OpenAIServingResponses(OpenAIServing):
         # we guarantee that if the status is not "completed", it is accurate.
         # "completed" is implemented as the "catch-all" for now.
         status: ResponseStatus = "completed"
+        stop_reason_: str | int | None = None
 
         input_messages: ResponseInputOutputMessage | None = None
         output_messages: ResponseInputOutputMessage | None = None
@@ -984,11 +993,17 @@ class OpenAIServingResponses(OpenAIServing):
         elif self.use_harmony:
             assert isinstance(context, HarmonyContext)
             output = self._make_response_output_items_with_harmony(context)
+            output, terminal = self._finalize_harmony_output_items(
+                context, output, request.request_id
+            )
             if request.enable_response_messages:
                 input_messages = context.messages[: context.num_init_messages]
                 output_messages = context.messages[context.num_init_messages :]
             num_tool_output_tokens = context.num_tool_output_tokens
-            if len(output) > 0:
+            if terminal.state is HarmonyTerminalState.CONTENT_NULL:
+                status = "incomplete"
+                stop_reason_ = CONTENT_NULL_STOP_REASON
+            elif len(output) > 0:
                 if context.finish_reason == "length":
                     status = "incomplete"
                 elif context.finish_reason == "abort":
@@ -1093,6 +1108,7 @@ class OpenAIServingResponses(OpenAIServing):
             status=status,
             usage=usage,
             kv_transfer_params=context.kv_transfer_params,
+            stop_reason=stop_reason_,
         )
 
         if request.store:
@@ -1269,6 +1285,32 @@ class OpenAIServingResponses(OpenAIServing):
         if last_items:
             output_items.extend(last_items)
         return output_items
+
+    def _finalize_harmony_output_items(
+        self,
+        context: HarmonyContext,
+        output_items: list[ResponseOutputItem],
+        request_id: str,
+        *,
+        log_content_null: bool = True,
+    ) -> tuple[list[ResponseOutputItem], HarmonyTerminalResult]:
+        output_items, terminal = apply_harmony_terminal_invariant(
+            output_items, context.output_token_ids
+        )
+        if terminal.state is HarmonyTerminalState.RECOVERED_CONTENT:
+            assert terminal.content is not None
+            context.record_terminal_recovery(terminal.content)
+            logger.warning(
+                "Recovered filtered Harmony content for Responses request %s.",
+                request_id,
+            )
+        elif terminal.state is HarmonyTerminalState.CONTENT_NULL and log_content_null:
+            logger.warning(
+                "Harmony produced no recoverable visible Responses content for "
+                "request %s; marking it content_null.",
+                request_id,
+            )
+        return output_items, terminal
 
     def _get_harmony_builtin_tool_descriptions(
         self, request: ResponsesRequest, tool_types: set[str]
@@ -1459,7 +1501,10 @@ class OpenAIServingResponses(OpenAIServing):
             while current_index < len(event_deque):
                 event = event_deque[current_index]
                 yield event
-                if getattr(event, "type", "unknown") == "response.completed":
+                if getattr(event, "type", "unknown") in {
+                    "response.completed",
+                    "response.incomplete",
+                }:
                     return
                 current_index += 1
 
@@ -1665,22 +1710,38 @@ class OpenAIServingResponses(OpenAIServing):
             # finish_reason='error' indicates a retryable error
             self._raise_if_error(ctx.finish_reason, request.request_id)
 
-            if ctx.is_expecting_start():
-                if len(ctx.parser.messages) > 0:
-                    previous_item = ctx.parser.messages[-1]
-                    for event in emit_previous_item_done_events(
-                        previous_item, state, ctx.function_tool_names
-                    ):
+            if not ctx.harmony_parse_failed:
+                if ctx.is_expecting_start():
+                    if len(ctx.parser.messages) > 0:
+                        previous_item = ctx.parser.messages[-1]
+                        for event in emit_previous_item_done_events(
+                            previous_item, state, ctx.function_tool_names
+                        ):
+                            yield _increment_sequence_number_and_return(event)
+                    state.reset_for_new_item()
+
+                # Stream the output of a harmony message
+                for event in emit_content_delta_events(ctx, state):
+                    yield _increment_sequence_number_and_return(event)
+
+                # Stream tool call outputs
+                for event in emit_tool_action_events(ctx, state, self.tool_server):
+                    yield _increment_sequence_number_and_return(event)
+
+            if ctx.last_output_finished:
+                output_items = self._make_response_output_items_with_harmony(ctx)
+                _, terminal = self._finalize_harmony_output_items(
+                    ctx,
+                    output_items,
+                    request.request_id,
+                    log_content_null=False,
+                )
+                if terminal.state is HarmonyTerminalState.RECOVERED_CONTENT:
+                    assert terminal.content is not None
+                    for event in emit_text_delta_events(terminal.content, state):
                         yield _increment_sequence_number_and_return(event)
-                state.reset_for_new_item()
-
-            # Stream the output of a harmony message
-            for event in emit_content_delta_events(ctx, state):
-                yield _increment_sequence_number_and_return(event)
-
-            # Stream tool call outputs
-            for event in emit_tool_action_events(ctx, state, self.tool_server):
-                yield _increment_sequence_number_and_return(event)
+                    for event in emit_text_output_done_events(terminal.content, state):
+                        yield _increment_sequence_number_and_return(event)
 
     async def responses_stream_generator(
         self,
@@ -1783,10 +1844,17 @@ class OpenAIServingResponses(OpenAIServing):
                 request_metadata,
                 created_time=created_time,
             )
-            yield _increment_sequence_number_and_return(
-                ResponseCompletedEvent(
+            assert isinstance(final_response, ResponsesResponse)
+            if final_response.status == "incomplete":
+                terminal_event: StreamingResponsesResponse = ResponseIncompleteEvent(
+                    type="response.incomplete",
+                    sequence_number=-1,
+                    response=final_response,
+                )
+            else:
+                terminal_event = ResponseCompletedEvent(
                     type="response.completed",
                     sequence_number=-1,
                     response=final_response,
                 )
-            )
+            yield _increment_sequence_number_and_return(terminal_event)

@@ -10,7 +10,12 @@ from openai.types.responses import (
 from openai.types.responses.response_output_item import McpCall
 from openai_harmony import Author, Message, Role, TextContent
 
+from vllm.entrypoints.openai.parser.harmony_utils import (
+    HarmonyTerminalState,
+    get_encoding,
+)
 from vllm.entrypoints.openai.responses.harmony import (
+    apply_harmony_terminal_invariant,
     harmony_to_response_output,
     parser_state_to_response_output,
     response_previous_input_to_harmony,
@@ -578,6 +583,66 @@ def test_parser_state_to_response_output_commentary_channel() -> None:
     assert preamble_items[0].type == "message"
     assert preamble_items[0].content[0].text == "I'll search for that information now."
     assert preamble_items[0].status == "incomplete"  # streaming
+
+
+class TestHarmonyResponsesTerminalInvariant:
+    @staticmethod
+    def _tokens(text: str) -> list[int]:
+        return get_encoding().encode(text, allowed_special="all")
+
+    def test_recovers_filtered_final_json(self) -> None:
+        token_ids = self._tokens(
+            '<|channel|>final<|constrain|>formatting{"ok":true}<|return|>'
+        )
+
+        output, terminal = apply_harmony_terminal_invariant([], token_ids)
+
+        assert terminal.state is HarmonyTerminalState.RECOVERED_CONTENT
+        assert len(output) == 1
+        assert isinstance(output[0], ResponseOutputMessage)
+        assert output[0].content[0].text == '{"ok":true}'
+
+    def test_ambiguous_channel_fails_closed(self) -> None:
+        token_ids = self._tokens(
+            '<|channel|>final_output<|message|>{"unsafe":true}<|return|>'
+        )
+
+        output, terminal = apply_harmony_terminal_invariant([], token_ids)
+
+        assert terminal.state is HarmonyTerminalState.CONTENT_NULL
+        assert output == []
+
+    def test_tool_call_takes_precedence(self) -> None:
+        tool_call = ResponseFunctionToolCall(
+            arguments='{"city":"Paris"}',
+            call_id="call_test",
+            name="get_weather",
+            type="function_call",
+            id="fc_test",
+            status="completed",
+        )
+
+        output, terminal = apply_harmony_terminal_invariant([tool_call], [])
+
+        assert terminal.state is HarmonyTerminalState.TOOL_CALLS
+        assert output == [tool_call]
+
+    def test_analysis_only_fails_closed(self) -> None:
+        reasoning = ResponseReasoningItem(
+            id="rs_test",
+            summary=[],
+            type="reasoning",
+            content=[],
+            status=None,
+        )
+        token_ids = self._tokens(
+            "<|channel|>analysis<|message|>hidden reasoning<|return|>"
+        )
+
+        output, terminal = apply_harmony_terminal_invariant([reasoning], token_ids)
+
+        assert terminal.state is HarmonyTerminalState.CONTENT_NULL
+        assert output == [reasoning]
 
 
 def test_parser_state_to_response_output_analysis_channel() -> None:

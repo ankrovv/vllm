@@ -14,7 +14,7 @@ from openai.types.responses.response_function_tool_call_output_item import (
     ResponseFunctionToolCallOutputItem,
 )
 from openai.types.responses.tool import Mcp
-from openai_harmony import Author, Message, Role, StreamState, TextContent
+from openai_harmony import Author, HarmonyError, Message, Role, StreamState, TextContent
 
 from vllm import envs
 from vllm.entrypoints.chat_utils import (
@@ -546,6 +546,10 @@ class HarmonyContext(ConversationContext):
         self.is_first_turn = True
         self.first_tok_of_message = True  # For streaming support
         self.kv_transfer_params: dict[str, Any] | None = None
+        self.output_token_ids: list[int] = []
+        self.harmony_parse_failed = False
+        self.last_output_finished = False
+        self._terminal_recovered_content: str | None = None
 
     def _update_num_reasoning_tokens(self):
         channel = self.parser.current_channel
@@ -558,9 +562,23 @@ class HarmonyContext(ConversationContext):
 
     def append_output(self, output: RequestOutput) -> None:
         output_token_ids = output.outputs[0].token_ids
+        self.output_token_ids = list(output_token_ids)
+        self.harmony_parse_failed = False
+        self.last_output_finished = output.finished
+        self._terminal_recovered_content = None
         self.parser = get_streamable_parser_for_assistant()
         for token_id in output_token_ids:
-            self.parser.process(token_id)
+            try:
+                self.parser.process(token_id)
+            except HarmonyError:
+                self.harmony_parse_failed = True
+                self.parser = get_streamable_parser_for_assistant()
+                logger.warning(
+                    "Harmony Responses parsing failed for request %s; "
+                    "deferring to terminal recovery.",
+                    output.request_id,
+                )
+                break
             # Check if the current token is part of reasoning content
             self._update_num_reasoning_tokens()
         self._update_prefill_token_usage(output)
@@ -573,10 +591,22 @@ class HarmonyContext(ConversationContext):
         # append_output is called only once before tool calling
         # in non-streaming case
         # so we can append all the parser messages to _messages
-        output_msgs = self.parser.messages
+        output_msgs = [] if self.harmony_parse_failed else self.parser.messages
         # The responses finish reason is set in the last message
         self.finish_reason = output.outputs[0].finish_reason
         self._messages.extend(output_msgs)
+
+    def record_terminal_recovery(self, content: str) -> None:
+        """Persist one filtered recovery for response output and replay."""
+
+        if self._terminal_recovered_content == content:
+            return
+        recovered_message = Message.from_role_and_content(
+            Role.ASSISTANT, content
+        ).with_channel("final")
+        self._messages.append(recovered_message)
+        self._terminal_recovered_content = content
+        self.parser = get_streamable_parser_for_assistant()
 
     def append_tool_output(self, output: list[Message]) -> None:
         output_msgs = output
@@ -865,30 +895,55 @@ class StreamingHarmonyContext(HarmonyContext):
         # so we only want to add the prompt tokens once for each message.
         self.last_content_delta = None
         if self.first_tok_of_message:
+            self.output_token_ids = []
+            self.harmony_parse_failed = False
+            self._terminal_recovered_content = None
+        if self.first_tok_of_message:
             self._update_prefill_token_usage(output)
         # Reset self.first_tok_of_message if needed:
         # if the current token is the last one of the current message
         # (finished=True), then the next token processed will mark the
         # beginning of a new message
         self.first_tok_of_message = output.finished
+        completion_output = output.outputs[0]
+        self.output_token_ids.extend(completion_output.token_ids)
         last_delta_text = ""
-        for tok in output.outputs[0].token_ids:
-            self.parser.process(tok)
+        for tok in completion_output.token_ids:
+            if self.harmony_parse_failed:
+                continue
+            try:
+                self.parser.process(tok)
+            except HarmonyError:
+                self.harmony_parse_failed = True
+                self.last_content_delta = None
+                logger.warning(
+                    "Harmony Responses streaming parse failed for request %s; "
+                    "deferring to terminal recovery.",
+                    output.request_id,
+                )
+                continue
             last_delta_text += self.parser.last_content_delta or ""
         if last_delta_text:
             self.last_content_delta = last_delta_text
         self._update_decode_token_usage(output)
         if output.kv_transfer_params is not None:
             self.kv_transfer_params = output.kv_transfer_params
+        self.finish_reason = completion_output.finish_reason
+        self.last_output = output
+        self.last_output_finished = output.finished
 
         # For streaming, update previous turn when message is complete
         if output.finished:
             self.all_turn_metrics.append(self.current_turn_metrics.copy())
             self.current_turn_metrics.reset()
         # Check if the current token is part of reasoning content
-        self._update_num_reasoning_tokens()
-        self.last_tok = tok
-        if len(self._messages) - self.num_init_messages < len(self.parser.messages):
+        if not self.harmony_parse_failed:
+            self._update_num_reasoning_tokens()
+        if completion_output.token_ids:
+            self.last_tok = completion_output.token_ids[-1]
+        if not self.harmony_parse_failed and len(
+            self._messages
+        ) - self.num_init_messages < len(self.parser.messages):
             self._messages.extend(
                 self.parser.messages[len(self._messages) - self.num_init_messages :]
             )
@@ -908,10 +963,16 @@ class StreamingHarmonyContext(HarmonyContext):
         # TODO: add tool_output messages to self._messages
 
     def is_expecting_start(self) -> bool:
-        return self.parser.state == StreamState.EXPECT_START
+        return (
+            not self.harmony_parse_failed
+            and self.parser.state == StreamState.EXPECT_START
+        )
 
     def is_assistant_action_turn(self) -> bool:
-        return self.last_tok in self.encoding.stop_tokens_for_assistant_actions()
+        return (
+            not self.harmony_parse_failed
+            and self.last_tok in self.encoding.stop_tokens_for_assistant_actions()
+        )
 
     def render_for_completion(self) -> list[int]:
         # now this list of tokens as next turn's starting tokens

@@ -9,6 +9,7 @@ Handles two directions:
 """
 
 import json
+from collections.abc import Sequence
 
 from openai.types.responses import (
     ResponseFunctionToolCall,
@@ -31,6 +32,9 @@ from openai_harmony import Author, Message, Role, StreamableParser, TextContent
 
 from vllm.entrypoints.openai.parser.harmony_utils import (
     BUILTIN_TOOL_TO_MCP_SERVER_LABEL,
+    HarmonyTerminalResult,
+    HarmonyTerminalState,
+    classify_harmony_terminal,
     extract_function_from_recipient,
     flatten_input_text_content,
     get_system_or_developer_message,
@@ -578,3 +582,53 @@ def parser_state_to_response_output(
         return [text_item]
 
     return []
+
+
+def apply_harmony_terminal_invariant(
+    output_items: list[ResponseOutputItem],
+    token_ids: Sequence[int],
+) -> tuple[list[ResponseOutputItem], HarmonyTerminalResult]:
+    """Apply the shared Harmony terminal invariant to Responses output."""
+
+    visible_text: list[str] = []
+    has_tool_calls = False
+    for item in output_items:
+        if isinstance(item, ResponseOutputMessage):
+            visible_text.extend(
+                content.text
+                for content in item.content
+                if isinstance(content, ResponseOutputText)
+            )
+        elif not isinstance(item, ResponseReasoningItem):
+            has_tool_calls = True
+
+    terminal = classify_harmony_terminal(
+        content="\n".join(visible_text),
+        has_tool_calls=has_tool_calls,
+        token_ids=token_ids,
+    )
+    if terminal.state not in {
+        HarmonyTerminalState.RECOVERED_CONTENT,
+        HarmonyTerminalState.CONTENT_NULL,
+    }:
+        return output_items, terminal
+
+    # Never retain completed message items with empty visible content.
+    filtered_items = [
+        item
+        for item in output_items
+        if not (
+            isinstance(item, ResponseOutputMessage)
+            and not any(
+                isinstance(content, ResponseOutputText) and content.text.strip()
+                for content in item.content
+            )
+        )
+    ]
+    if terminal.state is HarmonyTerminalState.RECOVERED_CONTENT:
+        assert terminal.content is not None
+        recovered_message = Message.from_role_and_content(
+            Role.ASSISTANT, terminal.content
+        ).with_channel("final")
+        filtered_items.append(_parse_final_message(recovered_message))
+    return filtered_items, terminal
