@@ -2,7 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import datetime
+import json
 from collections.abc import Iterable, Sequence
+from dataclasses import dataclass
+from enum import Enum
 from typing import Any
 
 from openai.types.responses.tool import Tool
@@ -11,6 +14,7 @@ from openai_harmony import (
     Conversation,
     DeveloperContent,
     HarmonyEncodingName,
+    HarmonyError,
     Message,
     ReasoningEffort,
     Role,
@@ -26,6 +30,29 @@ from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionTools
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
+
+CONTENT_NULL_STOP_REASON = "content_null"
+
+
+class HarmonyTerminalState(Enum):
+    """Outcome of classifying one completed Harmony choice."""
+
+    TOOL_CALLS = "tool_calls"
+    CONTENT = "content"
+    RECOVERED_CONTENT = "recovered_content"
+    CONTENT_NULL = "content_null"
+
+
+@dataclass(frozen=True)
+class HarmonyTerminalResult:
+    state: HarmonyTerminalState
+    content: str | None = None
+
+
+def is_visible_content_empty(content: str | None) -> bool:
+    """Return whether content is absent or only whitespace."""
+
+    return content is None or not content.strip()
 
 
 def is_function_recipient(
@@ -462,14 +489,375 @@ def render_for_completion(messages: list[Message]) -> list[int]:
     return token_ids
 
 
+class _HarmonyControlTokens:
+    """Cached Harmony control-token ids used to repair a missing delimiter.
+
+    Resolved lazily from the encoding so there are no magic token numbers.
+    """
+
+    def __init__(self) -> None:
+        enc = get_encoding()
+        self._enc = enc
+
+        def tid(text: str) -> int:
+            return enc.encode(text, allowed_special="all")[0]
+
+        self.channel = tid("<|channel|>")
+        self.message = tid("<|message|>")
+        self.constrain = tid("<|constrain|>")
+        self.recipient = tid(" to")  # start of a ` to=<recipient>` tool target
+        self.start = tid("<|start|>")
+        self.end = tid("<|end|>")
+        self.return_ = tid("<|return|>")
+        self.call = tid("<|call|>")
+        # Tokens that terminate or restart a header; content never starts with one.
+        self.breakers = {
+            tid("<|channel|>"),
+            self.start,
+            self.end,
+            self.return_,
+            self.call,
+        }
+        # Channel names whose content is user-visible (so a dropped body matters),
+        # as their token sequences (e.g. ``commentary`` is two tokens).
+        self.visible_channel_token_seqs = {
+            tuple(enc.encode("final", allowed_special="all")),
+            tuple(enc.encode("commentary", allowed_special="all")),
+        }
+
+    def is_whitespace(self, token_id: int) -> bool:
+        try:
+            return self._enc.decode([token_id]).strip() == ""
+        except Exception:
+            return False
+
+
+_harmony_control: _HarmonyControlTokens | None = None
+
+
+def _get_harmony_control() -> _HarmonyControlTokens:
+    global _harmony_control
+    if _harmony_control is None:
+        _harmony_control = _HarmonyControlTokens()
+    return _harmony_control
+
+
+def _matches_at(
+    token_ids: Sequence[int], start: int, expected: tuple[int, ...]
+) -> bool:
+    end = start + len(expected)
+    return end <= len(token_ids) and tuple(token_ids[start:end]) == expected
+
+
+def _header_has_recipient(
+    token_ids: Sequence[int], channel_index: int, message_index: int
+) -> bool:
+    """Conservatively detect a tool recipient around a channel header."""
+
+    ctrl = _get_harmony_control()
+    header_start = 0
+    for index in range(channel_index - 1, -1, -1):
+        if token_ids[index] in ctrl.breakers:
+            header_start = index + 1
+            break
+    return ctrl.recipient in token_ids[header_start:message_index]
+
+
+def _extract_complete_json(text: str, *, allow_metadata_prefix: bool) -> str | None:
+    """Return one complete JSON object/array surrounded only by allowed metadata."""
+
+    decoder = json.JSONDecoder()
+    harmless_wrapper_chars = frozenset(" \t\r\n()|`")
+    for index, char in enumerate(text):
+        if char not in "{[":
+            continue
+        try:
+            _, end = decoder.raw_decode(text[index:])
+        except json.JSONDecodeError:
+            continue
+        prefix = text[:index]
+        suffix = text[index + end :]
+        if any(char not in harmless_wrapper_chars for char in suffix):
+            continue
+        if not allow_metadata_prefix and any(
+            char not in harmless_wrapper_chars for char in prefix
+        ):
+            continue
+        return text[index : index + end]
+    return None
+
+
+def _extract_json_from_missing_body(text: str) -> str | None:
+    """Recover JSON while rejecting identifier-like channel continuations."""
+
+    recovered = _extract_complete_json(text, allow_metadata_prefix=True)
+    if recovered is None:
+        return None
+    prefix = text[: text.find(recovered)]
+    harmless_wrapper_chars = frozenset(' \t\r\n()|`".')
+    if all(char in harmless_wrapper_chars for char in prefix):
+        return recovered
+    if prefix[:1].isspace() and not any(
+        char.isascii() and (char.isalnum() or char == "_") for char in prefix
+    ):
+        return recovered
+    return None
+
+
+def _is_plausible_missing_message_body(text: str) -> bool:
+    """Reject channel-name continuations such as ``final_output``."""
+
+    return bool(text) and (text[0].isspace() or text[0] in '{[(.|`"')
+
+
+def recover_harmony_visible_content(token_ids: Sequence[int]) -> str | None:
+    """Recover only unambiguously user-visible Harmony message bodies.
+
+    This is intentionally narrower than decoding the raw model output. It accepts
+    exact ``final`` and recipient-less ``commentary`` channel headers, optionally
+    with a ``<|constrain|>...`` content type. It decodes only the delimited body,
+    or the body up to a terminal control token when ``<|message|>`` is missing.
+    Analysis, tool recipients, unknown channels, ambiguous nested headers, and
+    Harmony control tokens are never returned.
+    """
+
+    ctrl = _get_harmony_control()
+    recovered: list[str] = []
+
+    for channel_index, token_id in enumerate(token_ids):
+        if token_id != ctrl.channel:
+            continue
+
+        for channel_tokens in ctrl.visible_channel_token_seqs:
+            channel_start = channel_index + 1
+            if not _matches_at(token_ids, channel_start, channel_tokens):
+                continue
+
+            cursor = channel_start + len(channel_tokens)
+            while cursor < len(token_ids) and ctrl.is_whitespace(token_ids[cursor]):
+                cursor += 1
+            if cursor >= len(token_ids):
+                continue
+
+            constrained_without_delimiter = False
+            if token_ids[cursor] == ctrl.constrain:
+                cursor += 1
+                constrained_start = cursor
+                while cursor < len(token_ids) and token_ids[cursor] != ctrl.message:
+                    if token_ids[cursor] in ctrl.breakers:
+                        break
+                    cursor += 1
+                constrained_without_delimiter = (
+                    cursor >= len(token_ids) or token_ids[cursor] != ctrl.message
+                )
+
+                if constrained_without_delimiter:
+                    if _header_has_recipient(
+                        token_ids, channel_index, constrained_start
+                    ):
+                        continue
+                    raw_candidate = ctrl._enc.decode(
+                        token_ids[constrained_start:cursor]
+                    )
+                    recovered_json = _extract_complete_json(
+                        raw_candidate, allow_metadata_prefix=True
+                    )
+                    if recovered_json is not None:
+                        recovered.append(recovered_json)
+                    break
+
+            if cursor >= len(token_ids):
+                continue
+            if token_ids[cursor] == ctrl.recipient:
+                continue
+            has_message_delimiter = token_ids[cursor] == ctrl.message
+            if not has_message_delimiter and token_ids[cursor] in ctrl.breakers:
+                continue
+            if _header_has_recipient(token_ids, channel_index, cursor):
+                continue
+
+            body_start = cursor + 1 if has_message_delimiter else cursor
+            body_end = body_start
+            while (
+                body_end < len(token_ids) and token_ids[body_end] not in ctrl.breakers
+            ):
+                body_end += 1
+
+            body_tokens = token_ids[body_start:body_end]
+            # Nested header controls make the candidate ambiguous. Fail closed.
+            if ctrl.message in body_tokens or ctrl.constrain in body_tokens:
+                continue
+
+            body = ctrl._enc.decode(body_tokens)
+            if not has_message_delimiter:
+                if not _is_plausible_missing_message_body(body):
+                    continue
+                recovered_json = _extract_json_from_missing_body(body)
+                if recovered_json is not None:
+                    body = recovered_json
+                elif (
+                    _extract_complete_json(body, allow_metadata_prefix=True) is not None
+                ):
+                    continue
+            if not is_visible_content_empty(body):
+                recovered.append(body)
+            break
+
+    return "\n".join(recovered) or None
+
+
+def classify_harmony_terminal(
+    *,
+    content: str | None,
+    has_tool_calls: bool,
+    token_ids: Sequence[int],
+    allow_recovery: bool = True,
+) -> HarmonyTerminalResult:
+    """Classify a terminal Harmony choice without exposing hidden channels."""
+
+    if has_tool_calls:
+        return HarmonyTerminalResult(HarmonyTerminalState.TOOL_CALLS, content)
+    if not is_visible_content_empty(content):
+        return HarmonyTerminalResult(HarmonyTerminalState.CONTENT, content)
+    if allow_recovery:
+        recovered = recover_harmony_visible_content(token_ids)
+        if not is_visible_content_empty(recovered):
+            return HarmonyTerminalResult(
+                HarmonyTerminalState.RECOVERED_CONTENT, recovered
+            )
+    return HarmonyTerminalResult(HarmonyTerminalState.CONTENT_NULL, "")
+
+
+class _RepairingStreamableParser(StreamableParser):
+    """``StreamableParser`` that repairs a visible channel header emitted without
+    its ``<|message|>`` delimiter.
+
+    GPT-OSS occasionally emits a user-visible channel header (``<|channel|>final``
+    or ``<|channel|>commentary``) directly followed by the message body, omitting
+    the required ``<|message|>`` delimiter. The base parser then never leaves the
+    header state and the generated answer is silently dropped (the response
+    returns ``content=None`` even though the tokens were generated and billed).
+
+    This subclass watches the token stream and defers only a malformed visible
+    header until it sees either a real delimiter or the message terminator. In the
+    latter case it inserts the missing ``<|message|>`` and replays the buffered body
+    through the normal content path. It is a no-op on well-formed output. Because
+    every consumer -- streaming chat, non-streaming chat, and the Responses API --
+    builds its parser through ``get_streamable_parser_for_assistant``, repairing here
+    covers them all.
+    """
+
+    def __init__(self, encoding: Any, role: Any, *, strict: bool = True) -> None:
+        super().__init__(encoding, role, strict=strict)
+        self._ctrl = _get_harmony_control()
+        # State of the small header-tracking machine.
+        self._reading_channel_name = False  # just saw ``<|channel|>``
+        self._channel_name: tuple[int, ...] = ()
+        self._awaiting_delimiter = False  # in a visible header, no delimiter yet
+        self._pending_visible_tokens: list[int] = []
+        self._awaiting_constrained_delimiter = False
+        self._pending_constraint_tokens: list[int] = []
+
+    def process(self, token: int) -> "StreamableParser":
+        ctrl = self._ctrl
+        if self._awaiting_constrained_delimiter:
+            if token == ctrl.message:
+                # The body delimiter is unambiguous. Discard malformed content-
+                # type metadata and let the base parser consume the body normally.
+                self._pending_constraint_tokens.clear()
+                self._awaiting_constrained_delimiter = False
+                return super().process(token)
+            if token in ctrl.breakers:
+                # No body delimiter appeared. Leave the parser at the exact visible
+                # channel and let the terminal classifier inspect the raw tokens.
+                self._pending_constraint_tokens.clear()
+                self._awaiting_constrained_delimiter = False
+                return self
+            self._pending_constraint_tokens.append(token)
+            return self
+        if self._awaiting_delimiter:
+            if token == ctrl.message:
+                # A real delimiter wins. Anything buffered between the exact
+                # channel name and this delimiter was malformed header metadata,
+                # not message content.
+                self._pending_visible_tokens.clear()
+                self._awaiting_delimiter = False
+                return super().process(token)
+            if token == ctrl.constrain:
+                self._pending_visible_tokens.clear()
+                self._awaiting_delimiter = False
+                self._awaiting_constrained_delimiter = True
+                self._pending_constraint_tokens = []
+                return self
+            if token == ctrl.recipient:
+                self._pending_visible_tokens.clear()
+                self._awaiting_delimiter = False
+                return super().process(token)
+            if token in ctrl.breakers:
+                pending = self._pending_visible_tokens
+                self._pending_visible_tokens = []
+                self._awaiting_delimiter = False
+                if any(not ctrl.is_whitespace(item) for item in pending):
+                    pending_text = ctrl._enc.decode(pending)
+                    if not _is_plausible_missing_message_body(pending_text):
+                        return super().process(token)
+                    recovered_json = _extract_json_from_missing_body(pending_text)
+                    if recovered_json is not None:
+                        try:
+                            pending = ctrl._enc.encode(recovered_json)
+                        except ValueError:
+                            # A literal Harmony control marker inside the JSON is
+                            # ambiguous. Leave no content for the terminal guard.
+                            pending = []
+                    elif (
+                        _extract_complete_json(pending_text, allow_metadata_prefix=True)
+                        is not None
+                    ):
+                        return super().process(token)
+                    # No real delimiter appeared before the message ended. The
+                    # buffered tokens are the body, so replay them through the
+                    # normal content state after injecting ``<|message|>``.
+                    if pending:
+                        super().process(ctrl.message)
+                        for item in pending:
+                            super().process(item)
+                return super().process(token)
+            # Delay only a malformed visible header. This lookahead prevents a
+            # header such as ``final JSON<|message|>...`` from being mistaken for
+            # content while leaving well-formed output fully streaming.
+            self._pending_visible_tokens.append(token)
+            return self
+        if self._reading_channel_name:
+            self._channel_name += (token,)
+            name = self._channel_name
+            seqs = ctrl.visible_channel_token_seqs
+            if name in seqs:
+                self._reading_channel_name = False
+                self._awaiting_delimiter = True
+                self._pending_visible_tokens = []
+            elif not any(seq[: len(name)] == name for seq in seqs):
+                self._reading_channel_name = False  # analysis / unrecognized
+            return super().process(token)
+        if token == ctrl.channel:
+            self._reading_channel_name = True
+            self._channel_name = ()
+        return super().process(token)
+
+
 def get_streamable_parser_for_assistant() -> StreamableParser:
-    return StreamableParser(get_encoding(), role=Role.ASSISTANT)
+    return _RepairingStreamableParser(get_encoding(), role=Role.ASSISTANT)
 
 
 def parse_output_into_messages(token_ids: Iterable[int]) -> StreamableParser:
     parser = get_streamable_parser_for_assistant()
     for token_id in token_ids:
-        parser.process(token_id)
+        try:
+            parser.process(token_id)
+        except HarmonyError:
+            logger.warning(
+                "Harmony parsing failed; deferring to filtered terminal recovery."
+            )
+            return get_streamable_parser_for_assistant()
     return parser
 
 

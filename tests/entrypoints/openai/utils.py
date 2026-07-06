@@ -27,6 +27,7 @@ async def accumulate_streaming_response(
     accumulated_tool_calls: list[dict[str, Any]] = []
     role = None
     finish_reason = None
+    stop_reason = None
     response_id = None
     created = None
     model = None
@@ -90,6 +91,7 @@ async def accumulate_streaming_response(
 
                     if choice.finish_reason:
                         finish_reason = choice.finish_reason
+                        stop_reason = choice.stop_reason
                     if choice.index is not None:
                         index = choice.index
 
@@ -117,6 +119,7 @@ async def accumulate_streaming_response(
         index=index,
         message=message,
         finish_reason=finish_reason or "stop",
+        stop_reason=stop_reason,
     )
 
     # Create usage info (with dummy values for tests)

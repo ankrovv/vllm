@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Any, Final
 import numpy as np
 import pybase64 as base64
 from fastapi import Request
+from openai_harmony import HarmonyError
 
 from vllm.engine.protocol import EngineClient
 from vllm.entrypoints.chat_utils import (
@@ -56,6 +57,9 @@ from vllm.entrypoints.openai.engine.serving import (
 )
 from vllm.entrypoints.openai.models.serving import OpenAIServingModels
 from vllm.entrypoints.openai.parser.harmony_utils import (
+    CONTENT_NULL_STOP_REASON,
+    HarmonyTerminalState,
+    classify_harmony_terminal,
     get_streamable_parser_for_assistant,
     parse_chat_output,
 )
@@ -421,8 +425,10 @@ class OpenAIServingChat(OpenAIServing):
         self,
         request: ChatCompletionRequest,
     ) -> bool:
-        return self.use_harmony and request.tool_choice == "required" and bool(
-            request.tools
+        return (
+            self.use_harmony
+            and request.tool_choice == "required"
+            and bool(request.tools)
         )
 
     def _parse_harmony_required_tool_calls(
@@ -500,14 +506,18 @@ class OpenAIServingChat(OpenAIServing):
         finish_reason_sent = [False] * num_choices
         num_prompt_tokens = 0
         num_cached_tokens = None
-        is_harmony_required_tool_choice = self._is_harmony_required_tool_choice(
-            request
-        )
+        is_harmony_required_tool_choice = self._is_harmony_required_tool_choice(request)
+        harmony_output_token_ids: list[list[int]] | None = None
+        harmony_visible_content: list[str] | None = None
+        harmony_parse_failed: list[bool] | None = None
         if self.use_harmony:
             harmony_parsers = [
                 get_streamable_parser_for_assistant() for _ in range(num_choices)
             ]
             harmony_tools_streamed = [False] * num_choices
+            harmony_output_token_ids = [[] for _ in range(num_choices)]
+            harmony_visible_content = [""] * num_choices
+            harmony_parse_failed = [False] * num_choices
         required_tool_name_returned = [False] * num_choices
         tools_streamed = [False] * num_choices
 
@@ -680,6 +690,10 @@ class OpenAIServingChat(OpenAIServing):
                     parser = parsers[i]
                     tool_parser = parser.tool_parser if parser is not None else None
 
+                    if self.use_harmony:
+                        assert harmony_output_token_ids is not None
+                        harmony_output_token_ids[i].extend(output.token_ids)
+
                     if (
                         reasoning_parser
                         and res.prompt_token_ids
@@ -709,22 +723,44 @@ class OpenAIServingChat(OpenAIServing):
                         delta_text = output.text
                     elif self.use_harmony:
                         harmony_parser = harmony_parsers[i]
-                        prev_recipient = harmony_parser.current_recipient
+                        assert harmony_parse_failed is not None
+                        prev_recipient = (
+                            None
+                            if harmony_parse_failed[i]
+                            else harmony_parser.current_recipient
+                        )
 
                         # Track accumulated content per token with their state
                         token_states: list[TokenState] = []
                         for token_id in output.token_ids:
-                            harmony_parser.process(token_id)
-                            token_delta = harmony_parser.last_content_delta or ""
-                            token_states.append(
-                                TokenState(
-                                    harmony_parser.current_channel,
-                                    harmony_parser.current_recipient,
-                                    token_delta,
+                            if harmony_parse_failed[i]:
+                                token_states.append(TokenState(None, None, ""))
+                                continue
+                            try:
+                                harmony_parser.process(token_id)
+                                token_delta = harmony_parser.last_content_delta or ""
+                                token_states.append(
+                                    TokenState(
+                                        harmony_parser.current_channel,
+                                        harmony_parser.current_recipient,
+                                        token_delta,
+                                    )
                                 )
-                            )
+                            except HarmonyError:
+                                harmony_parse_failed[i] = True
+                                token_states.append(TokenState(None, None, ""))
+                                logger.warning(
+                                    "Harmony streaming parse failed for request %s "
+                                    "choice %d; deferring to terminal recovery.",
+                                    request_id,
+                                    i,
+                                )
                         delta_text = "".join(delta for _, _, delta in token_states)
-                        cur_channel = harmony_parser.current_channel
+                        cur_channel = (
+                            None
+                            if harmony_parse_failed[i]
+                            else harmony_parser.current_channel
+                        )
 
                         # handle the case where several tokens where generated at once
                         # including the final token, leading to a delta in the text
@@ -844,6 +880,10 @@ class OpenAIServingChat(OpenAIServing):
                     else:
                         delta_message = DeltaMessage(content=delta_text)
 
+                    if self.use_harmony and delta_message and delta_message.content:
+                        assert harmony_visible_content is not None
+                        harmony_visible_content[i] += delta_message.content
+
                     # update the previous values for the next iteration
                     if (
                         is_mistral_grammar_path
@@ -945,12 +985,45 @@ class OpenAIServingChat(OpenAIServing):
                             finish_reason_ = (
                                 output.finish_reason if output.finish_reason else "stop"
                             )
+                        stop_reason_ = output.stop_reason
+                        if self.use_harmony:
+                            assert harmony_output_token_ids is not None
+                            assert harmony_visible_content is not None
+                            terminal = classify_harmony_terminal(
+                                content=harmony_visible_content[i],
+                                has_tool_calls=(
+                                    tools_streamed[i] or harmony_tools_streamed[i]
+                                ),
+                                token_ids=harmony_output_token_ids[i],
+                                allow_recovery=not is_harmony_required_tool_choice,
+                            )
+                            if terminal.state is HarmonyTerminalState.RECOVERED_CONTENT:
+                                delta_message.content = terminal.content
+                                logger.warning(
+                                    "Recovered filtered Harmony content for streaming "
+                                    "request %s choice %d.",
+                                    request_id,
+                                    i,
+                                )
+                            elif terminal.state is HarmonyTerminalState.CONTENT_NULL:
+                                # Never terminate a no-tool Harmony choice as
+                                # 200/stop with empty visible content.
+                                delta_message.content = ""
+                                finish_reason_ = "length"
+                                stop_reason_ = CONTENT_NULL_STOP_REASON
+                                logger.warning(
+                                    "Harmony produced no recoverable visible content "
+                                    "for streaming request %s choice %d; marking it "
+                                    "content_null.",
+                                    request_id,
+                                    i,
+                                )
                         choice_data = ChatCompletionResponseStreamChoice(
                             index=i,
                             delta=delta_message,
                             logprobs=logprobs,
                             finish_reason=finish_reason_,
-                            stop_reason=output.stop_reason,
+                            stop_reason=stop_reason_,
                             token_ids=(
                                 as_list(output.token_ids)
                                 if request.return_token_ids
@@ -1192,18 +1265,47 @@ class OpenAIServingChat(OpenAIServing):
                         "ascii"
                     )
 
+                finish_reason_ = (
+                    "tool_calls"
+                    if (tool_call_info is not None and tool_call_info.tools_called)
+                    else output.finish_reason
+                    if output.finish_reason
+                    else "stop"
+                )
+                stop_reason_ = output.stop_reason
+                terminal = classify_harmony_terminal(
+                    content=(
+                        message.content if isinstance(message.content, str) else None
+                    ),
+                    has_tool_calls=bool(message.tool_calls),
+                    token_ids=token_ids,
+                    allow_recovery=not self._is_harmony_required_tool_choice(request),
+                )
+                if terminal.state is HarmonyTerminalState.RECOVERED_CONTENT:
+                    message.content = terminal.content
+                    logger.warning(
+                        "Recovered filtered Harmony content for request %s choice %d.",
+                        request_id,
+                        output.index,
+                    )
+                elif terminal.state is HarmonyTerminalState.CONTENT_NULL:
+                    # Override the engine stop locally; do not mutate RequestOutput.
+                    message.content = ""
+                    finish_reason_ = "length"
+                    stop_reason_ = CONTENT_NULL_STOP_REASON
+                    logger.warning(
+                        "Harmony produced no recoverable visible content for request "
+                        "%s choice %d; marking it content_null.",
+                        request_id,
+                        output.index,
+                    )
+
                 choice_data = ChatCompletionResponseChoice(
                     index=output.index,
                     message=message,
                     logprobs=logprobs,
-                    finish_reason=(
-                        "tool_calls"
-                        if (tool_call_info is not None and tool_call_info.tools_called)
-                        else output.finish_reason
-                        if output.finish_reason
-                        else "stop"
-                    ),
-                    stop_reason=output.stop_reason,
+                    finish_reason=finish_reason_,
+                    stop_reason=stop_reason_,
                     token_ids=(
                         as_list(output.token_ids) if request.return_token_ids else None
                     ),

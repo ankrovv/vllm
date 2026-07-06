@@ -1284,6 +1284,7 @@ class TestServingChatWithHarmony:
         req: ChatCompletionRequest,
         harmony_str: str,
         stream: bool = False,
+        finish_reason: str | None = None,
     ) -> ChatCompletionResponse:
         harmony_token_ids = get_encoding().encode(harmony_str, allowed_special="all")
 
@@ -1294,11 +1295,14 @@ class TestServingChatWithHarmony:
                         req, [token_id]
                     )
                 yield self.mock_request_output_from_req_and_token_ids(
-                    req, [], finished=True
+                    req, [], finished=True, finish_reason=finish_reason
                 )
             else:
                 yield self.mock_request_output_from_req_and_token_ids(
-                    req, harmony_token_ids, finished=True
+                    req,
+                    harmony_token_ids,
+                    finished=True,
+                    finish_reason=finish_reason,
                 )
 
         generator_func = (
@@ -1487,8 +1491,8 @@ class TestServingChatWithHarmony:
             tool_choice="required",
         )
 
-        generate_request = await (
-            serving_chat.openai_serving_render.render_chat_request(req)
+        generate_request = await serving_chat.openai_serving_render.render_chat_request(
+            req
         )
 
         assert not isinstance(generate_request, ErrorResponse)
@@ -1657,6 +1661,61 @@ class TestServingChatWithHarmony:
                 {"role": "assistant", "channel": "final", "content": final_str},
             ],
         )
+
+    @pytest.mark.asyncio
+    async def test_malformed_constraint_recovers_filtered_json(
+        self, serving_chat, stream
+    ):
+        req = ChatCompletionRequest(
+            model=MODEL_NAME,
+            messages=[{"role": "user", "content": "Return JSON."}],
+        )
+        response_str = (
+            "<|channel|>analysis<|message|>private reasoning<|end|>"
+            "<|start|>assistant<|channel|>final "
+            '<|constrain|>response{"ok":true}<|return|>'
+        )
+        response = await self.generate_response_from_harmony_str(
+            serving_chat,
+            req,
+            response_str,
+            stream=stream,
+            finish_reason="stop",
+        )
+
+        choice = response.choices[0]
+        assert choice.message.content == '{"ok":true}'
+        assert choice.finish_reason == "stop"
+        assert choice.stop_reason is None
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "response_str",
+        [
+            "<|channel|>analysis<|message|>private reasoning<|return|>",
+            '<|channel|>final_output<|message|>{"ambiguous":true}<|return|>',
+        ],
+        ids=["analysis_only", "unknown_channel"],
+    )
+    async def test_empty_or_ambiguous_output_is_explicitly_incomplete(
+        self, serving_chat, stream, response_str
+    ):
+        req = ChatCompletionRequest(
+            model=MODEL_NAME,
+            messages=[{"role": "user", "content": "Return JSON."}],
+        )
+        response = await self.generate_response_from_harmony_str(
+            serving_chat,
+            req,
+            response_str,
+            stream=stream,
+            finish_reason="stop",
+        )
+
+        choice = response.choices[0]
+        assert not (choice.message.content or "").strip()
+        assert choice.finish_reason == "length"
+        assert choice.stop_reason == "content_null"
 
     @pytest.mark.asyncio
     async def test_system_message_without_tools(self, serving_chat, stream):

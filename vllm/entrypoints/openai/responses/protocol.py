@@ -39,6 +39,9 @@ from openai.types.responses import (
 )
 from openai.types.responses import ResponseCreatedEvent as OpenAIResponseCreatedEvent
 from openai.types.responses import (
+    ResponseIncompleteEvent as OpenAIResponseIncompleteEvent,
+)
+from openai.types.responses import (
     ResponseInProgressEvent as OpenAIResponseInProgressEvent,
 )
 from openai.types.responses.response import IncompleteDetails, ToolChoice
@@ -621,6 +624,9 @@ class ResponsesResponse(OpenAIBaseModel):
     reasoning: Reasoning | None = None
     service_tier: Literal["auto", "default", "flex", "scale", "priority"]
     status: ResponseStatus
+    # vLLM extension used to distinguish parser-incomplete output from a real
+    # max-output-token truncation while retaining the standard Responses status.
+    stop_reason: str | int | None = None
     text: ResponseTextConfig | None = None
     top_logprobs: int | None = None
     truncation: Literal["auto", "disabled"]
@@ -695,6 +701,7 @@ class ResponsesResponse(OpenAIBaseModel):
         input_messages: ResponseInputOutputMessage | None = None,
         output_messages: ResponseInputOutputMessage | None = None,
         kv_transfer_params: dict[str, Any] | None = None,
+        stop_reason: str | int | None = None,
     ) -> "ResponsesResponse":
         incomplete_details: IncompleteDetails | None = None
         if status == "incomplete":
@@ -727,6 +734,7 @@ class ResponsesResponse(OpenAIBaseModel):
             presence_penalty=sampling_params.presence_penalty,
             frequency_penalty=sampling_params.frequency_penalty,
             status=status,
+            stop_reason=stop_reason,
             text=request.text,
             top_logprobs=sampling_params.logprobs,
             truncation=request.truncation,
@@ -794,10 +802,15 @@ class ResponseInProgressEvent(OpenAIResponseInProgressEvent):
     response: ResponsesResponse  # type: ignore[override]
 
 
+class ResponseIncompleteEvent(OpenAIResponseIncompleteEvent):
+    response: ResponsesResponse  # type: ignore[override]
+
+
 StreamingResponsesResponse: TypeAlias = (
     ResponseCreatedEvent
     | ResponseInProgressEvent
     | ResponseCompletedEvent
+    | ResponseIncompleteEvent
     | ResponseOutputItemAddedEvent
     | ResponseOutputItemDoneEvent
     | ResponseContentPartAddedEvent
