@@ -364,6 +364,31 @@ def _parse_final_message(message: Message) -> ResponseOutputItem:
     )
 
 
+def _normalize_recipient(recipient: str | None) -> str | None:
+    """Strip a leaked ``<|constrain|>`` content-type marker from a recipient.
+
+    openai-harmony can mis-read the ``<|constrain|>json`` content-type of a
+    constrained ``final`` message as the message recipient (upstream issue
+    vllm-project/vllm#45570; fixed upstream by #45657). Left untouched, such a
+    recipient is routed to :func:`_parse_mcp_call` and the control token leaks
+    into an ``mcp_call`` item's ``name``/``server_label``. Strip the marker; if
+    nothing real precedes it, there is no recipient.
+
+    Args:
+        recipient: The raw recipient string from the Harmony message.
+
+    Returns:
+        The recipient with any trailing ``<|constrain|>...`` removed, or
+        ``None`` when only the marker remained.
+    """
+    if not recipient:
+        return recipient
+    constrain_index = recipient.find("<|constrain|>")
+    if constrain_index == -1:
+        return recipient
+    return recipient[:constrain_index].rstrip() or None
+
+
 def _parse_mcp_recipient(recipient: str) -> tuple[str, str]:
     """Parse MCP recipient into (server_label, tool_name).
 
@@ -443,7 +468,7 @@ def harmony_to_response_output(
         return []
 
     output_items: list[ResponseOutputItem] = []
-    recipient = message.recipient
+    recipient = _normalize_recipient(message.recipient)
 
     if recipient is not None:
         # Browser tool calls (browser.search, browser.open, browser.find)
