@@ -1535,7 +1535,7 @@ class OpenAIServingResponses(OpenAIServing):
                 )
             )
 
-            streamed_function_calls: list[ResponseFunctionToolCall] = []
+            streamed_output_items: dict[int, ResponseOutputItem] = {}
             try:
                 async for event_data in processor(
                     request,
@@ -1551,9 +1551,8 @@ class OpenAIServingResponses(OpenAIServing):
                     if (
                         not self.use_harmony
                         and event_data.type == "response.output_item.done"
-                        and isinstance(event_data.item, ResponseFunctionToolCall)
                     ):
-                        streamed_function_calls.append(event_data.item)
+                        streamed_output_items[event_data.output_index] = event_data.item
                     yield event_data
             except GenerationError as e:
                 error_json = self._convert_generation_error_to_streaming_response(e)
@@ -1580,16 +1579,20 @@ class OpenAIServingResponses(OpenAIServing):
             )
             if (
                 not self.use_harmony
-                and streamed_function_calls
+                and streamed_output_items
                 and isinstance(final_response, ResponsesResponse)
             ):
-                streamed_calls = iter(streamed_function_calls)
-                final_response.output = [
-                    next(streamed_calls, item)
-                    if isinstance(item, ResponseFunctionToolCall)
-                    else item
-                    for item in final_response.output
-                ]
+                for output_index, streamed_item in streamed_output_items.items():
+                    if output_index >= len(final_response.output):
+                        continue
+                    item = final_response.output[output_index]
+                    if streamed_item.type != item.type:
+                        continue
+                    item.id = streamed_item.id
+                    if isinstance(item, ResponseFunctionToolCall) and isinstance(
+                        streamed_item, ResponseFunctionToolCall
+                    ):
+                        item.call_id = streamed_item.call_id
             yield _increment_sequence_number_and_return(
                 ResponseCompletedEvent(
                     type="response.completed",
