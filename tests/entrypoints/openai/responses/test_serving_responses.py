@@ -1202,6 +1202,101 @@ class TestAutoToolStreaming:
 
     @pytest.mark.skip_global_cleanup
     @pytest.mark.asyncio
+    async def test_completed_reuses_streamed_reasoning_and_message_ids(
+        self, monkeypatch
+    ):
+        monkeypatch.setattr(envs, "VLLM_USE_EXPERIMENTAL_PARSER_CONTEXT", False)
+        serving = _make_serving_instance_with_reasoning()
+        response_parser = _mock_parser_with_reasoning(
+            serving,
+            [
+                DeltaMessage(reasoning="thinking"),
+                DeltaMessage(content="Hello"),
+            ],
+        )
+
+        async def result_generator():
+            yield _make_simple_context_with_output("chunk1", [10], response_parser)
+            yield _make_simple_context_with_output("chunk2", [20], response_parser)
+
+        request = ResponsesRequest(input="hi", stream=True)
+        sampling_params = SamplingParams(max_tokens=64)
+
+        async def fake_full_generator(*args, **kwargs):
+            return ResponsesResponse.from_request(
+                request,
+                sampling_params,
+                model_name="test-model",
+                created_time=0,
+                output=[
+                    ResponseReasoningItem(
+                        id="reasoning_full_parse",
+                        summary=[],
+                        type="reasoning",
+                        content=[],
+                        encrypted_content=None,
+                        status="completed",
+                    ),
+                    ResponseOutputMessage(
+                        id="msg_full_parse",
+                        content=[
+                            ResponseOutputText(
+                                annotations=[],
+                                text="Hello",
+                                type="output_text",
+                                logprobs=[
+                                    {
+                                        "token": "Hello",
+                                        "bytes": [72, 101, 108, 108, 111],
+                                        "logprob": -0.1,
+                                        "top_logprobs": [],
+                                    }
+                                ],
+                            )
+                        ],
+                        role="assistant",
+                        status="completed",
+                        type="message",
+                    ),
+                ],
+                status="completed",
+                usage=None,
+            )
+
+        serving.responses_full_generator = fake_full_generator
+
+        events = [
+            event
+            async for event in serving.responses_stream_generator(
+                request=request,
+                sampling_params=sampling_params,
+                result_generator=result_generator(),
+                context=SimpleContext(response_parser=response_parser),
+                model_name="test-model",
+                tokenizer=MagicMock(),
+                request_metadata=RequestResponseMetadata(request_id="req"),
+                created_time=0,
+            )
+        ]
+
+        stream_done = {
+            event.item.type: event
+            for event in events
+            if event.type == "response.output_item.done"
+        }
+        completed = next(
+            event for event in events if event.type == "response.completed"
+        )
+        reasoning_item, message_item = completed.response.output
+
+        assert isinstance(reasoning_item, ResponseReasoningItem)
+        assert isinstance(message_item, ResponseOutputMessage)
+        for event in stream_done.values():
+            assert completed.response.output[event.output_index].id == event.item.id
+        assert message_item.content[0].logprobs
+
+    @pytest.mark.skip_global_cleanup
+    @pytest.mark.asyncio
     async def test_completed_reuses_streamed_tool_call_and_preserves_text(
         self, monkeypatch
     ):
@@ -1246,6 +1341,14 @@ class TestAutoToolStreaming:
                 model_name="test-model",
                 created_time=0,
                 output=[
+                    ResponseFunctionToolCall(
+                        type="function_call",
+                        id="fc_full_parse",
+                        call_id="chatcmpl-tool-full-parse-id",
+                        name="get_weather",
+                        arguments=tool_args,
+                        status="completed",
+                    ),
                     ResponseOutputMessage(
                         id="msg_full_parse",
                         content=[
@@ -1266,14 +1369,6 @@ class TestAutoToolStreaming:
                         role="assistant",
                         status="completed",
                         type="message",
-                    ),
-                    ResponseFunctionToolCall(
-                        type="function_call",
-                        id="fc_full_parse",
-                        call_id="chatcmpl-tool-full-parse-id",
-                        name="get_weather",
-                        arguments=tool_args,
-                        status="completed",
                     ),
                 ],
                 status="completed",
@@ -1307,8 +1402,8 @@ class TestAutoToolStreaming:
         )
 
         assert stream_done.item.call_id == "chatcmpl-tool-stream-id"
-        message_item = completed.response.output[0]
-        tool_item = completed.response.output[1]
+        tool_item = completed.response.output[stream_done.output_index]
+        message_item = completed.response.output[1]
         assert isinstance(message_item, ResponseOutputMessage)
         assert isinstance(tool_item, ResponseFunctionToolCall)
         assert message_item.content[0].logprobs
