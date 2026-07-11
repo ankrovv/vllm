@@ -151,6 +151,8 @@ def _normalize_chat_completions_image_parts(content: list) -> list:
             image_url = part.get("image_url")
             if isinstance(image_url, dict) and "url" in image_url:
                 part["image_url"] = image_url["url"]
+                if "detail" not in part and "detail" in image_url:
+                    part["detail"] = image_url["detail"]
             part.setdefault("detail", "auto")
         normalized.append(part)
     return normalized

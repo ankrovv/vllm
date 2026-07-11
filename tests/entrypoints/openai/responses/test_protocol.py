@@ -12,10 +12,28 @@ from vllm.entrypoints.openai.responses.protocol import (
 )
 
 
-@pytest.mark.parametrize("part_type", ["input_image", "image_url"])
-def test_input_image_accepts_chat_completions_format(part_type: str) -> None:
-    # Regression test for #46631: chat-completions image parts (image_url type,
-    # nested image_url, missing detail) must be accepted.
+@pytest.mark.parametrize(
+    ("part_type", "image_url", "expected_detail"),
+    [
+        ("input_image", "data:image/png;base64,AAAA", "auto"),
+        ("input_image", {"url": "data:image/png;base64,AAAA"}, "auto"),
+        (
+            "image_url",
+            {"url": "data:image/png;base64,AAAA", "detail": "low"},
+            "low",
+        ),
+        (
+            "image_url",
+            {"url": "data:image/png;base64,AAAA", "detail": "high"},
+            "high",
+        ),
+    ],
+)
+def test_input_image_defaults_detail_and_accepts_chat_format(
+    part_type: str, image_url: str | dict[str, str], expected_detail: str
+) -> None:
+    # Regression test for #46631: flat Responses images with missing detail and
+    # chat-completions image parts must both be accepted.
     req = ResponsesRequest.model_validate(
         {
             "model": "test",
@@ -26,7 +44,7 @@ def test_input_image_accepts_chat_completions_format(part_type: str) -> None:
                         {"type": "input_text", "text": "what is this?"},
                         {
                             "type": part_type,
-                            "image_url": {"url": "data:image/png;base64,AAAA"},
+                            "image_url": image_url,
                         },
                     ],
                 }
@@ -38,7 +56,7 @@ def test_input_image_accepts_chat_completions_format(part_type: str) -> None:
     # required `detail` defaulted to "auto".
     assert image_part["type"] == "input_image"
     assert image_part["image_url"] == "data:image/png;base64,AAAA"
-    assert image_part["detail"] == "auto"
+    assert image_part["detail"] == expected_detail
 
 
 def test_serialize_message() -> None:
