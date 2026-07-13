@@ -133,6 +133,31 @@ ResponseInputOutputMessage: TypeAlias = (
 ResponseInputOutputItem: TypeAlias = ResponseInputItemParam | ResponseOutputItem
 
 
+def _normalize_chat_completions_image_parts(content: list) -> list:
+    """Normalize chat-completions image parts to the flat
+    ResponseInputImageParam schema (#46631).
+
+    Accepts the chat-style ``image_url`` type, nested ``image_url``
+    (``{"url": ...}``), and a missing ``detail``.
+    """
+    normalized = []
+    for part in content:
+        if isinstance(part, dict) and part.get("type") in (
+            "input_image",
+            "image_url",
+        ):
+            part = dict(part)
+            part["type"] = "input_image"
+            image_url = part.get("image_url")
+            if isinstance(image_url, dict) and "url" in image_url:
+                part["image_url"] = image_url["url"]
+                if "detail" not in part and "detail" in image_url:
+                    part["detail"] = image_url["detail"]
+            part.setdefault("detail", "auto")
+        normalized.append(part)
+    return normalized
+
+
 class ResponsesRequest(OpenAIBaseModel):
     # Ordered by official OpenAI API documentation
     # https://platform.openai.com/docs/api-reference/responses/create
@@ -375,7 +400,7 @@ class ResponsesRequest(OpenAIBaseModel):
         # Structured output
         structured_outputs = self.structured_outputs
 
-        # Also check text.format for OpenAI-style json_schema
+        # Also check text.format for OpenAI-style structured outputs
         if self.text is not None and self.text.format is not None:
             if structured_outputs is not None:
                 raise VLLMValidationError(
@@ -392,6 +417,8 @@ class ResponsesRequest(OpenAIBaseModel):
                     # --follow-imports skip hides the class definition but also hides
                     # multiple third party conflicts, so best of both evils
                 )
+            elif response_format.type == "json_object":
+                structured_outputs = StructuredOutputsParams(json_object=True)
 
         stop = self.stop if self.stop else []
         if isinstance(stop, str):
@@ -499,6 +526,13 @@ class ResponsesRequest(OpenAIBaseModel):
             if not isinstance(item, dict):
                 processed_input.append(item)
                 continue
+
+            content = item.get("content")
+            if isinstance(content, list):
+                item = {
+                    **item,
+                    "content": _normalize_chat_completions_image_parts(content),
+                }
 
             item_type = item.get("type")
 

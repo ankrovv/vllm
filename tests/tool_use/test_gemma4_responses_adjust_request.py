@@ -21,12 +21,9 @@ calling for parsers relying on special-token delimiters (Gemma4):
    ``model_dump``. It also passed a ``description`` kwarg carrying the
    wrong-purpose string ``"Response format for tool calling"``.
 
-3. :class:`Gemma4EngineToolParser` (the engine-based parser, #45588) sets
-   ``supports_required_and_named=False`` but did not skip the forced
-   ``structured_outputs`` JSON for ``required``/named tool choice. The model
-   was constrained to JSON the native parser cannot read, so the call leaked
-   as content with empty ``tool_calls``. ``adjust_request`` now skips that
-   constraint so Gemma4 emits its native ``<|tool_call>`` syntax.
+3. :class:`Gemma4EngineToolParser` must enforce ``required`` and named tool
+   choice with the standard JSON constraint. Automatic tool choice continues
+   to use Gemma's native ``<|tool_call>`` syntax.
 """
 
 from __future__ import annotations
@@ -37,6 +34,7 @@ from openai.types.responses.tool_param import FunctionToolParam
 
 from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
 from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
+from vllm.parser.abstract_parser import DelegatingParser, StreamState
 from vllm.tool_parsers.abstract_tool_parser import ToolParser
 from vllm.tool_parsers.gemma4_engine_tool_parser import (
     Gemma4EngineToolParser as Gemma4ToolParser,
@@ -110,6 +108,10 @@ class _StubTokenizer:
         }
 
 
+class _Gemma4DelegatingParser(DelegatingParser):
+    tool_parser_cls = Gemma4ToolParser
+
+
 def test_gemma4_adjust_request_sets_skip_special_tokens_on_responses() -> None:
     """``Gemma4ToolParser.adjust_request`` must flip
     ``skip_special_tokens=False`` for both ``ChatCompletionRequest`` and
@@ -160,26 +162,23 @@ def test_tool_parser_adjust_request_builds_valid_response_text_config() -> None:
     assert fmt.get("description") in (None, "")
 
 
-def test_gemma4_required_skips_structured_outputs_chatcompletion() -> None:
-    """required + ChatCompletion: ``Gemma4EngineToolParser`` must skip the
-    forced JSON ``structured_outputs`` so the model emits its native
-    ``<|tool_call>`` syntax. The base parser constrained output to JSON the
-    native parser cannot read, leaking it as content with empty
-    ``tool_calls`` (regression after #45588).
-    """
+def test_gemma4_required_enforces_structured_outputs_chatcompletion() -> None:
+    """required + ChatCompletion must constrain output to a tool-call list."""
     parser = Gemma4ToolParser(_StubTokenizer())
     request = _build_chat_request(tool_choice="required")
 
     parser.adjust_request(request)
 
-    assert request.structured_outputs is None
+    assert parser.supports_required_and_named is True
+    assert parser.engine_based_streaming is True
+    assert parser.cumulative_tool_streaming_for_required_and_named is True
+    assert request.structured_outputs is not None
+    assert request.structured_outputs.json is not None
     assert request.skip_special_tokens is False
 
 
-def test_gemma4_named_skips_structured_outputs_chatcompletion() -> None:
-    """named + ChatCompletion: the forced single-function JSON schema must be
-    skipped, same as ``required``.
-    """
+def test_gemma4_named_enforces_structured_outputs_chatcompletion() -> None:
+    """named + ChatCompletion must constrain output to function arguments."""
     parser = Gemma4ToolParser(_StubTokenizer())
     request = _build_chat_request(
         tool_choice={"type": "function", "function": {"name": "get_weather"}}
@@ -187,27 +186,26 @@ def test_gemma4_named_skips_structured_outputs_chatcompletion() -> None:
 
     parser.adjust_request(request)
 
-    assert request.structured_outputs is None
+    assert request.structured_outputs is not None
+    assert request.structured_outputs.json is not None
     assert request.skip_special_tokens is False
 
 
-def test_gemma4_required_skips_structured_outputs_responses() -> None:
-    """required + Responses: the forced JSON schema (``request.text``) must be
-    skipped so the native delimiters reach the extractor.
-    """
+def test_gemma4_required_enforces_structured_outputs_responses() -> None:
+    """required + Responses must constrain output to a tool-call list."""
     parser = Gemma4ToolParser(_StubTokenizer())
     request = _build_responses_request(tool_choice="required")
 
     parser.adjust_request(request)
 
-    assert request.text is None
+    assert request.text is not None
+    assert request.text.format is not None
+    assert request.text.format.type == "json_schema"
     assert request.skip_special_tokens is False
 
 
-def test_gemma4_named_skips_structured_outputs_responses() -> None:
-    """named (``ToolChoiceFunction``) + Responses: the forced single-function
-    JSON schema must be skipped.
-    """
+def test_gemma4_named_enforces_structured_outputs_responses() -> None:
+    """named + Responses must constrain output to function arguments."""
     parser = Gemma4ToolParser(_StubTokenizer())
     request = _build_responses_request(
         tool_choice={"type": "function", "name": "get_weather"}
@@ -215,8 +213,78 @@ def test_gemma4_named_skips_structured_outputs_responses() -> None:
 
     parser.adjust_request(request)
 
-    assert request.text is None
+    assert request.text is not None
+    assert request.text.format is not None
+    assert request.text.format.type == "json_schema"
     assert request.skip_special_tokens is False
+
+
+def test_gemma4_required_parses_constrained_output() -> None:
+    """The constrained required output must become a function call."""
+    request = _build_responses_request(tool_choice="required")
+    parser = _Gemma4DelegatingParser(_StubTokenizer(), tools=request.tools)
+
+    reasoning, content, tool_calls = parser.parse(
+        '[{"name":"get_weather","parameters":{"city":"Paris"}}]',
+        request,
+        enable_auto_tools=True,
+    )
+
+    assert reasoning is None
+    assert content is None
+    assert tool_calls is not None
+    assert len(tool_calls) == 1
+    assert tool_calls[0].name == "get_weather"
+    assert tool_calls[0].arguments == '{"city": "Paris"}'
+
+
+def test_gemma4_named_parses_constrained_output() -> None:
+    """The constrained named output must use the requested function name."""
+    request = _build_chat_request(
+        tool_choice={"type": "function", "function": {"name": "get_weather"}}
+    )
+    parser = _Gemma4DelegatingParser(_StubTokenizer(), tools=request.tools)
+
+    reasoning, content, tool_calls = parser.parse(
+        '{"city":"Paris"}', request, enable_auto_tools=True
+    )
+
+    assert reasoning is None
+    assert content is None
+    assert tool_calls is not None
+    assert len(tool_calls) == 1
+    assert tool_calls[0].name == "get_weather"
+    assert tool_calls[0].arguments == '{"city":"Paris"}'
+
+
+def test_gemma4_accumulates_only_for_forced_tool_streaming() -> None:
+    """Gemma keeps native delta streaming for auto and accumulates forced JSON."""
+    parser = _Gemma4DelegatingParser(_StubTokenizer())
+    parser._stream_state.reasoning_ended = True
+
+    assert parser._uses_cumulative_tool_stream_state(
+        _build_responses_request(tool_choice="required")
+    )
+    assert parser._uses_cumulative_tool_stream_state(
+        _build_responses_request(
+            tool_choice={"type": "function", "name": "get_weather"}
+        )
+    )
+    assert not parser._uses_cumulative_tool_stream_state(
+        _build_responses_request(tool_choice="auto")
+    )
+
+
+def test_engine_stream_state_accumulates_only_when_requested() -> None:
+    """Engine parsers retain normal delta behavior unless JSON needs history."""
+    state = StreamState(engine_based=True)
+    assert state.advance("first", [1]) == ("first", [1])
+    state.commit("first", [1])
+    assert state.previous_text == ""
+
+    assert state.advance("second", [2], cumulative=True) == ("second", [2])
+    state.commit("second", [2], cumulative=True)
+    assert state.advance("third", [3], cumulative=True) == ("secondthird", [2, 3])
 
 
 def test_gemma4_keeps_special_tokens_with_tools_thinking_disabled() -> None:

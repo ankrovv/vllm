@@ -56,8 +56,10 @@ class StreamState:
         self,
         delta_text: str,
         delta_token_ids: list[int],
+        *,
+        cumulative: bool = False,
     ) -> tuple[str, list[int]]:
-        if self.engine_based:
+        if self.engine_based and not cumulative:
             return delta_text, delta_token_ids
         return (
             self.previous_text + delta_text,
@@ -68,8 +70,10 @@ class StreamState:
         self,
         current_text: str,
         current_token_ids: list[int],
+        *,
+        cumulative: bool = False,
     ) -> None:
-        if self.engine_based:
+        if self.engine_based and not cumulative:
             self.previous_text = ""
             self.previous_token_ids = []
         else:
@@ -374,6 +378,22 @@ class DelegatingParser(Parser):
         ):
             return request.tool_choice.function.name
         raise ValueError("Invalid tool_choice for function name extraction.")
+
+    def _uses_cumulative_tool_stream_state(
+        self, request: ChatCompletionRequest | ResponsesRequest
+    ) -> bool:
+        """Whether standard forced-tool streaming needs accumulated JSON."""
+        tool_parser = self._tool_parser
+        if (
+            tool_parser is None
+            or not tool_parser.cumulative_tool_streaming_for_required_and_named
+            or not tool_parser.supports_required_and_named
+        ):
+            return False
+        return request.tool_choice == "required" or isinstance(
+            request.tool_choice,
+            (ToolChoiceFunction, ChatCompletionNamedToolChoiceParam),
+        )
 
     def _extract_tool_calls(
         self,
@@ -766,7 +786,14 @@ class DelegatingParser(Parser):
                     prompt_token_ids
                 )
 
-        current_text, current_token_ids = state.advance(delta_text, delta_token_ids)
+        cumulative_tool_stream = (
+            state.reasoning_ended and self._uses_cumulative_tool_stream_state(request)
+        )
+        current_text, current_token_ids = state.advance(
+            delta_text,
+            delta_token_ids,
+            cumulative=cumulative_tool_stream,
+        )
         delta_message: DeltaMessage | None = None
         reasoning_transitioned = False
 
@@ -861,7 +888,14 @@ class DelegatingParser(Parser):
         ):
             delta_message = DeltaMessage(content=delta_text)
 
-        state.commit(current_text, current_token_ids)
+        state.commit(
+            current_text,
+            current_token_ids,
+            cumulative=(
+                state.reasoning_ended
+                and self._uses_cumulative_tool_stream_state(request)
+            ),
+        )
 
         if finished:
             delta_message = self.finalize_generation(delta_message, request, state)

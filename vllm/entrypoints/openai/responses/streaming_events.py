@@ -1033,10 +1033,11 @@ def emit_simple_tool_call_open(
     state: SimpleStreamingState,
     name: str,
     index: int | None,
+    call_id: str | None = None,
 ) -> list[StreamingResponsesResponse]:
     state.current_state = _StateType.TOOL_CALL
     state.current_item_id = random_uuid()
-    state.tool_call_id = f"call_{random_uuid()}"
+    state.tool_call_id = call_id or f"call_{random_uuid()}"
     state.tool_call_name = name
     state.tool_call_index = index
     state.accumulated_text = ""
@@ -1242,7 +1243,10 @@ class SimpleStreamingEventProcessor:
         if target_state == _StateType.TOOL_CALL:
             assert tool_call is not None
             return handlers.open_fn(
-                self.state, tool_call.function.name, tool_call.index
+                self.state,
+                tool_call.function.name,
+                tool_call.index,
+                tool_call.id,
             )
         return handlers.open_fn(self.state)
 

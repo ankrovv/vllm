@@ -16,6 +16,7 @@ from openai.types.responses import (
     ResponseOutputItem,
     ResponseOutputMessage,
     ResponseOutputText,
+    ResponseReasoningItem,
     ResponseStatus,
     response_text_delta_event,
 )
@@ -1535,6 +1536,7 @@ class OpenAIServingResponses(OpenAIServing):
                 )
             )
 
+            streamed_output_items: dict[int, ResponseOutputItem] = {}
             try:
                 async for event_data in processor(
                     request,
@@ -1547,6 +1549,11 @@ class OpenAIServingResponses(OpenAIServing):
                     created_time,
                     _increment_sequence_number_and_return,
                 ):
+                    if (
+                        not self.use_harmony
+                        and event_data.type == "response.output_item.done"
+                    ):
+                        streamed_output_items[event_data.output_index] = event_data.item
                     yield event_data
             except GenerationError as e:
                 error_json = self._convert_generation_error_to_streaming_response(e)
@@ -1571,6 +1578,31 @@ class OpenAIServingResponses(OpenAIServing):
                 request_metadata,
                 created_time=created_time,
             )
+            if (
+                not self.use_harmony
+                and streamed_output_items
+                and isinstance(final_response, ResponsesResponse)
+            ):
+                for output_index, streamed_item in streamed_output_items.items():
+                    if output_index >= len(final_response.output):
+                        continue
+                    item = final_response.output[output_index]
+                    if streamed_item.type != item.type:
+                        continue
+                    item.id = streamed_item.id
+                    if isinstance(item, ResponseOutputMessage) and isinstance(
+                        streamed_item, ResponseOutputMessage
+                    ):
+                        item.summary = streamed_item.summary
+                    if isinstance(item, ResponseReasoningItem) and isinstance(
+                        streamed_item, ResponseReasoningItem
+                    ):
+                        item.status = streamed_item.status
+                    if isinstance(item, ResponseFunctionToolCall) and isinstance(
+                        streamed_item, ResponseFunctionToolCall
+                    ):
+                        item.call_id = streamed_item.call_id
+                        item.arguments = streamed_item.arguments
             yield _increment_sequence_number_and_return(
                 ResponseCompletedEvent(
                     type="response.completed",

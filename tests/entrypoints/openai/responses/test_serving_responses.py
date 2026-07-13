@@ -7,7 +7,10 @@ from unittest.mock import MagicMock
 import pytest
 import pytest_asyncio
 from openai.types.responses import (
+    ResponseFunctionToolCall,
     ResponseOutputItemDoneEvent,
+    ResponseOutputMessage,
+    ResponseOutputText,
     ResponseReasoningItem,
     ResponseReasoningTextDeltaEvent,
     ResponseReasoningTextDoneEvent,
@@ -667,6 +670,20 @@ def _make_simple_context_with_output(text, token_ids, response_parser=None):
     return ctx
 
 
+def _get_weather_tool():
+    return {
+        "type": "function",
+        "name": "get_weather",
+        "description": "Get weather.",
+        "parameters": {
+            "type": "object",
+            "properties": {"location": {"type": "string"}},
+            "required": ["location"],
+            "additionalProperties": False,
+        },
+    }
+
+
 def _make_serving_instance_with_reasoning():
     """Create an OpenAIServingResponses with a mocked reasoning parser."""
     engine_client = MagicMock()
@@ -956,19 +973,7 @@ class TestAutoToolStreaming:
 
         request = ResponsesRequest(
             input="hi",
-            tools=[
-                {
-                    "type": "function",
-                    "name": "get_weather",
-                    "description": "Get weather.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {"location": {"type": "string"}},
-                        "required": ["location"],
-                        "additionalProperties": False,
-                    },
-                }
-            ],
+            tools=[_get_weather_tool()],
             tool_choice="auto",
             stream=True,
         )
@@ -1194,3 +1199,218 @@ class TestAutoToolStreaming:
         assert len(function_done) == 1
         assert function_done[0].item.name == "get_weather"
         assert function_done[0].item.arguments == tool_args
+
+    @pytest.mark.skip_global_cleanup
+    @pytest.mark.asyncio
+    async def test_completed_reuses_streamed_reasoning_and_message_ids(
+        self, monkeypatch
+    ):
+        monkeypatch.setattr(envs, "VLLM_USE_EXPERIMENTAL_PARSER_CONTEXT", False)
+        serving = _make_serving_instance_with_reasoning()
+        response_parser = _mock_parser_with_reasoning(
+            serving,
+            [
+                DeltaMessage(reasoning="thinking"),
+                DeltaMessage(content="Hello"),
+            ],
+        )
+
+        async def result_generator():
+            yield _make_simple_context_with_output("chunk1", [10], response_parser)
+            yield _make_simple_context_with_output("chunk2", [20], response_parser)
+
+        request = ResponsesRequest(input="hi", stream=True)
+        sampling_params = SamplingParams(max_tokens=64)
+
+        async def fake_full_generator(*args, **kwargs):
+            return ResponsesResponse.from_request(
+                request,
+                sampling_params,
+                model_name="test-model",
+                created_time=0,
+                output=[
+                    ResponseReasoningItem(
+                        id="reasoning_full_parse",
+                        summary=[],
+                        type="reasoning",
+                        content=[],
+                        encrypted_content=None,
+                        status=None,
+                    ),
+                    ResponseOutputMessage(
+                        id="msg_full_parse",
+                        content=[
+                            ResponseOutputText(
+                                annotations=[],
+                                text="Hello",
+                                type="output_text",
+                                logprobs=[
+                                    {
+                                        "token": "Hello",
+                                        "bytes": [72, 101, 108, 108, 111],
+                                        "logprob": -0.1,
+                                        "top_logprobs": [],
+                                    }
+                                ],
+                            )
+                        ],
+                        role="assistant",
+                        status="completed",
+                        type="message",
+                    ),
+                ],
+                status="completed",
+                usage=None,
+            )
+
+        serving.responses_full_generator = fake_full_generator
+
+        events = [
+            event
+            async for event in serving.responses_stream_generator(
+                request=request,
+                sampling_params=sampling_params,
+                result_generator=result_generator(),
+                context=SimpleContext(response_parser=response_parser),
+                model_name="test-model",
+                tokenizer=MagicMock(),
+                request_metadata=RequestResponseMetadata(request_id="req"),
+                created_time=0,
+            )
+        ]
+
+        stream_done = {
+            event.item.type: event
+            for event in events
+            if event.type == "response.output_item.done"
+        }
+        completed = next(
+            event for event in events if event.type == "response.completed"
+        )
+        reasoning_item, message_item = completed.response.output
+
+        assert isinstance(reasoning_item, ResponseReasoningItem)
+        assert isinstance(message_item, ResponseOutputMessage)
+        for event in stream_done.values():
+            assert completed.response.output[event.output_index].id == event.item.id
+        assert reasoning_item.status == "completed"
+        assert message_item.content[0].logprobs
+        assert "summary" in message_item.model_fields_set
+
+    @pytest.mark.skip_global_cleanup
+    @pytest.mark.asyncio
+    async def test_completed_reuses_streamed_tool_call_and_preserves_text(
+        self, monkeypatch
+    ):
+        monkeypatch.setattr(envs, "VLLM_USE_EXPERIMENTAL_PARSER_CONTEXT", False)
+        serving = _make_serving_instance_with_reasoning()
+        streamed_tool_args = '{\n  "location": "Berlin"\n}'
+        full_parse_tool_args = '{"location":"Berlin"}'
+
+        response_parser = _mock_parser_with_reasoning(
+            serving,
+            [
+                DeltaMessage(
+                    tool_calls=[
+                        DeltaToolCall(
+                            id="chatcmpl-tool-stream-id",
+                            type="function",
+                            index=0,
+                            function=DeltaFunctionCall(
+                                name="get_weather",
+                                arguments=streamed_tool_args,
+                            ),
+                        )
+                    ]
+                )
+            ],
+        )
+
+        async def result_generator():
+            yield _make_simple_context_with_output("chunk", [10], response_parser)
+
+        request = ResponsesRequest(
+            input="hi",
+            tools=[_get_weather_tool()],
+            tool_choice="auto",
+            stream=True,
+        )
+        sampling_params = SamplingParams(max_tokens=64)
+
+        async def fake_full_generator(*args, **kwargs):
+            return ResponsesResponse.from_request(
+                request,
+                sampling_params,
+                model_name="test-model",
+                created_time=0,
+                output=[
+                    ResponseFunctionToolCall(
+                        type="function_call",
+                        id="fc_full_parse",
+                        call_id="chatcmpl-tool-full-parse-id",
+                        name="get_weather",
+                        arguments=full_parse_tool_args,
+                        status="completed",
+                    ),
+                    ResponseOutputMessage(
+                        id="msg_full_parse",
+                        content=[
+                            ResponseOutputText(
+                                annotations=[],
+                                text="The weather is mild.",
+                                type="output_text",
+                                logprobs=[
+                                    {
+                                        "token": "The",
+                                        "bytes": [84, 104, 101],
+                                        "logprob": -0.1,
+                                        "top_logprobs": [],
+                                    }
+                                ],
+                            )
+                        ],
+                        role="assistant",
+                        status="completed",
+                        type="message",
+                    ),
+                ],
+                status="completed",
+                usage=None,
+            )
+
+        serving.responses_full_generator = fake_full_generator
+
+        events = [
+            event
+            async for event in serving.responses_stream_generator(
+                request=request,
+                sampling_params=sampling_params,
+                result_generator=result_generator(),
+                context=SimpleContext(response_parser=response_parser),
+                model_name="test-model",
+                tokenizer=MagicMock(),
+                request_metadata=RequestResponseMetadata(request_id="req"),
+                created_time=0,
+            )
+        ]
+
+        stream_done = next(
+            event
+            for event in events
+            if event.type == "response.output_item.done"
+            and getattr(event.item, "type", None) == "function_call"
+        )
+        completed = next(
+            event for event in events if event.type == "response.completed"
+        )
+
+        assert stream_done.item.call_id == "chatcmpl-tool-stream-id"
+        tool_item = completed.response.output[stream_done.output_index]
+        message_item = completed.response.output[1]
+        assert isinstance(message_item, ResponseOutputMessage)
+        assert isinstance(tool_item, ResponseFunctionToolCall)
+        assert message_item.content[0].logprobs
+        assert tool_item.id == stream_done.item.id
+        assert tool_item.call_id == "chatcmpl-tool-stream-id"
+        assert tool_item.name == "get_weather"
+        assert tool_item.arguments == streamed_tool_args
