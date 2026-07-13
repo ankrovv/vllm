@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import functools
 import json
+from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
 import regex as re
@@ -216,6 +217,32 @@ class Qwen3Parser(ParserEngine):
         if not self.thinking_enabled:
             return None, model_output
         return super().extract_reasoning(model_output, request)
+
+    def count_reasoning_tokens(self, token_ids: Sequence[int]) -> int:
+        """Count Qwen's generated reasoning before its first end marker.
+
+        Qwen starts generation in reasoning mode and normally emits only the
+        closing marker, so the generic marker-pair counter reports zero.
+        A tool-call start is also a Qwen reasoning terminator.
+        """
+        if not self.thinking_enabled:
+            return 0
+
+        if self.parser_engine_config.name != "qwen3":
+            # Nemotron V3 inherits this parser but supplies its own engine
+            # configuration and accounting semantics.
+            return super().count_reasoning_tokens(token_ids)
+
+        count = 0
+        for token_id in token_ids:
+            if token_id in {
+                self._reasoning_end_token_id,
+                self._tool_call_token_id,
+            }:
+                break
+            if token_id != self._reasoning_start_token_id:
+                count += 1
+        return count
 
     def is_reasoning_end(self, input_ids: list[int]) -> bool:
         if super().is_reasoning_end(input_ids):

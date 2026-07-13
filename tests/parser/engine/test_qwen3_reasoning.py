@@ -21,6 +21,7 @@ from vllm.parser.engine.registered_adapters import (
     Qwen3ParserReasoningAdapter,
     Qwen3ParserToolAdapter,
 )
+from vllm.parser.nemotron_v3 import NemotronV3Parser
 from vllm.parser.qwen3 import Qwen3Parser, qwen3_config
 
 _THINK_START_ID = 50
@@ -190,6 +191,40 @@ class TestIsReasoningEnd:
 
     def test_empty_ids(self, parser):
         assert not parser.is_reasoning_end([])
+
+
+class TestReasoningTokenAccounting:
+    @pytest.mark.parametrize(
+        ("token_ids", "expected"),
+        [
+            ([_TEXT_ID, _TEXT_ID, _THINK_END_ID, _TEXT_ID], 2),
+            ([_THINK_START_ID, _TEXT_ID, _THINK_END_ID, _TEXT_ID], 1),
+            ([_TEXT_ID, _TEXT_ID], 2),
+            ([_TEXT_ID, _TOOL_CALL_ID, _TEXT_ID], 1),
+        ],
+    )
+    def test_counts_markerless_and_implicit_end_reasoning(
+        self, parser, token_ids, expected
+    ):
+        assert parser.count_reasoning_tokens(token_ids) == expected
+
+    def test_disabled_thinking_counts_no_reasoning(self, mock_tokenizer):
+        parser = Qwen3Parser(
+            mock_tokenizer,
+            chat_template_kwargs={"enable_thinking": False},
+        )
+
+        assert parser.count_reasoning_tokens([_TEXT_ID, _THINK_END_ID]) == 0
+
+    def test_reasoning_adapter_forwards_qwen_count(self, mock_tokenizer):
+        parser = Qwen3ParserReasoningAdapter(mock_tokenizer)
+
+        assert parser.count_reasoning_tokens([_TEXT_ID, _THINK_END_ID]) == 1
+
+    def test_nemotron_inherits_its_existing_counter(self, mock_tokenizer):
+        parser = NemotronV3Parser(mock_tokenizer)
+
+        assert parser.count_reasoning_tokens([_TEXT_ID, _THINK_END_ID]) == 0
 
 
 class TestDelegatingPromptDetection:
