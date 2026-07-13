@@ -1235,7 +1235,7 @@ class TestAutoToolStreaming:
                         type="reasoning",
                         content=[],
                         encrypted_content=None,
-                        status="completed",
+                        status=None,
                     ),
                     ResponseOutputMessage(
                         id="msg_full_parse",
@@ -1293,7 +1293,9 @@ class TestAutoToolStreaming:
         assert isinstance(message_item, ResponseOutputMessage)
         for event in stream_done.values():
             assert completed.response.output[event.output_index].id == event.item.id
+        assert reasoning_item.status == "completed"
         assert message_item.content[0].logprobs
+        assert "summary" in message_item.model_fields_set
 
     @pytest.mark.skip_global_cleanup
     @pytest.mark.asyncio
@@ -1302,7 +1304,8 @@ class TestAutoToolStreaming:
     ):
         monkeypatch.setattr(envs, "VLLM_USE_EXPERIMENTAL_PARSER_CONTEXT", False)
         serving = _make_serving_instance_with_reasoning()
-        tool_args = '{"location":"Berlin"}'
+        streamed_tool_args = '{\n  "location": "Berlin"\n}'
+        full_parse_tool_args = '{"location":"Berlin"}'
 
         response_parser = _mock_parser_with_reasoning(
             serving,
@@ -1315,7 +1318,7 @@ class TestAutoToolStreaming:
                             index=0,
                             function=DeltaFunctionCall(
                                 name="get_weather",
-                                arguments=tool_args,
+                                arguments=streamed_tool_args,
                             ),
                         )
                     ]
@@ -1346,7 +1349,7 @@ class TestAutoToolStreaming:
                         id="fc_full_parse",
                         call_id="chatcmpl-tool-full-parse-id",
                         name="get_weather",
-                        arguments=tool_args,
+                        arguments=full_parse_tool_args,
                         status="completed",
                     ),
                     ResponseOutputMessage(
@@ -1410,4 +1413,4 @@ class TestAutoToolStreaming:
         assert tool_item.id == stream_done.item.id
         assert tool_item.call_id == "chatcmpl-tool-stream-id"
         assert tool_item.name == "get_weather"
-        assert tool_item.arguments == tool_args
+        assert tool_item.arguments == streamed_tool_args

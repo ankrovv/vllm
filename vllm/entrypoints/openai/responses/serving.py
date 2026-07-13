@@ -16,6 +16,7 @@ from openai.types.responses import (
     ResponseOutputItem,
     ResponseOutputMessage,
     ResponseOutputText,
+    ResponseReasoningItem,
     ResponseStatus,
     response_text_delta_event,
 )
@@ -1589,10 +1590,19 @@ class OpenAIServingResponses(OpenAIServing):
                     if streamed_item.type != item.type:
                         continue
                     item.id = streamed_item.id
+                    if isinstance(item, ResponseOutputMessage) and isinstance(
+                        streamed_item, ResponseOutputMessage
+                    ):
+                        item.summary = streamed_item.summary
+                    if isinstance(item, ResponseReasoningItem) and isinstance(
+                        streamed_item, ResponseReasoningItem
+                    ):
+                        item.status = streamed_item.status
                     if isinstance(item, ResponseFunctionToolCall) and isinstance(
                         streamed_item, ResponseFunctionToolCall
                     ):
                         item.call_id = streamed_item.call_id
+                        item.arguments = streamed_item.arguments
             yield _increment_sequence_number_and_return(
                 ResponseCompletedEvent(
                     type="response.completed",
